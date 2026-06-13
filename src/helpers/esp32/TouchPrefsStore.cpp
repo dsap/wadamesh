@@ -157,7 +157,7 @@ bool touchPrefsSetEnabledLayouts(uint16_t mask) {
 }
 
 static const char* KEY_TILE_SRV = "tile_srv";
-static const char* DEFAULT_TILE_SERVER = "http://tiles.meshcomod.com";
+static const char* DEFAULT_TILE_SERVER = "http://tiles.wadamesh.com";
 
 int touchPrefsGetTileServer(char* out, int out_cap) {
   if (!out || out_cap <= 0) return 0;

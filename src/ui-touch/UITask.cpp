@@ -1527,7 +1527,7 @@ static void versionCheckUpdateUi() {
     snprintf(b, sizeof b, "Firmware %s\nDevelopment build — update check off", FIRMWARE_VERSION);
     lv_obj_set_style_text_color(s_update_about_lbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   } else if (s_update_available && s_verchk_latest_n >= 0) {
-    snprintf(b, sizeof b, LV_SYMBOL_DOWNLOAD "  Update available: beta_%d\nYou have beta_%d — update manually at flasher.meshcomod.com",
+    snprintf(b, sizeof b, LV_SYMBOL_DOWNLOAD "  Update available: beta_%d\nYou have beta_%d — update manually at flasher.wadamesh.com",
              s_verchk_latest_n, my_n);
     lv_obj_set_style_text_color(s_update_about_lbl, lv_color_hex(0xE2A23A), LV_PART_MAIN);
   } else if (s_verchk_latest_n >= 0) {
@@ -1589,12 +1589,12 @@ static void otaInstallLatestCb(lv_event_t* e) {
   if (s_ota_status_lbl) {
     lv_label_set_text(s_ota_status_lbl,
       "Wi-Fi update is paused while we fix some issues.\n"
-      "Please update manually at flasher.meshcomod.com\n"
+      "Please update manually at flasher.wadamesh.com\n"
       "(T-Deck under Launcher: reinstall the new bin there).");
     lv_obj_set_style_text_color(s_ota_status_lbl, lv_color_hex(0xE2A23A), LV_PART_MAIN);
   }
   if (g_lv.task)
-    g_lv.task->showAlert(TR("Update manually at flasher.meshcomod.com\n(Wi-Fi update is paused for now)"), 3500);
+    g_lv.task->showAlert(TR("Update manually at flasher.wadamesh.com\n(Wi-Fi update is paused for now)"), 3500);
 }
 
 // Trigger a check once Wi-Fi is up (then every 6 h); apply the result when ready.
@@ -11851,7 +11851,7 @@ static void ensureTilesDirPath(uint8_t z, int32_t x) {
 // ----- Firmware version check (reuses the core-0 fetch worker) -----
 // The web flasher lists releases under prebuilt/releases/TOUCH/ via the GitHub
 // API. The device can't do HTTPS, but the meshcomod proxy exposes that same API
-// over plain HTTP at app.meshcomod.com/api-github/. We GET the TOUCH listing,
+// over plain HTTP at firmware.wadamesh.com/releases/. We GET the TOUCH listing,
 // scan for the highest pre-alpha_<N>, and compare to our embedded release tag.
 // (s_verchk_request / s_verchk_done / s_verchk_latest_n are declared globally
 // near the version-check UI helpers above.)
@@ -11865,8 +11865,8 @@ static int verchkFetchLatest(WiFiClient& client, HTTPClient& http) {
   http.setReuse(false);
   http.setConnectTimeout(8000);
   http.setTimeout(12000);
-  http.setUserAgent("meshcomod-touch");
-  if (!http.begin(client, "http://app.meshcomod.com/api-github/contents/prebuilt/releases/TOUCH")) {
+  http.setUserAgent("wadamesh-touch");
+  if (!http.begin(client, "http://firmware.wadamesh.com/releases/TOUCH")) {
     return -1;
   }
   const int code = http.GET();
@@ -11910,7 +11910,7 @@ static void tileFetchTaskFn(void* arg) {
   // wants ~30 KB internal heap during the handshake and after Wi-Fi
   // associates only ~5 KB is free. OSM itself only serves HTTPS, but a
   // tiny user-side proxy (Render / Fly / nginx — ~30 lines) forwards
-  // http://tiles.meshcomod.com/{z}/{x}/{y}.png  →  https://tile.osm.org.
+  // http://tiles.wadamesh.com/{z}/{x}/{y}.png  →  https://tile.osm.org.
   // Default base URL is hard-coded; user can override via Settings.
   WiFiClient client;
   HTTPClient http;
@@ -12089,7 +12089,7 @@ static void tileFetchTaskFn(void* arg) {
     http.setConnectTimeout(3000);
     http.setTimeout(2000);
     // OSM policy: identifying User-Agent required; vague UAs get blocked.
-    http.addHeader("User-Agent", "meshcomod-touch/0.4 (https://github.com/ALLFATHER-BV/meshcomod)");
+    http.addHeader("User-Agent", "wadamesh-touch/0.4 (https://github.com/ALLFATHER-BV/wadamesh)");
     Serial.printf("[TILE] GET %s\n", url);
     s_tile_fetch_step = 'g';
     int code = http.GET();
