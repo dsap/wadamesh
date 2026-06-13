@@ -4131,11 +4131,21 @@ static void doExportBackupFile(const char* fname);   // write a backup (SD if a 
 // file-manager format/paste paths already use. Ref-counted so a nested guard
 // (import -> persistHistoryNow -> saveHistoryToStorage) doesn't re-enable early.
 static int s_wdt_heavy_depth = 0;
+// IMPORTANT: touch ONLY core 0's IDLE-task WDT here. In the Arduino S3 build
+// only core 0's idle task is subscribed to the task watchdog
+// (CHECK_IDLE_TASK_CPU1 is off), so disableCore1WDT() merely fails ("Failed to
+// remove Core 1 IDLE task from WDT") while enableCore1WDT() *newly subscribes*
+// IDLE1 — arming a core-1 watchdog that didn't exist before. A later
+// multi-second UI-thread flash burst (SPIFFS GC during a history save) then
+// starves IDLE1 and reboots (task_wdt: IDLE1). i.e. the old guard CAUSED the
+// very reboot it was meant to prevent. Leaving core 1 alone restores the
+// Arduino default (loopTask not WDT-watched), so the slow write just stalls
+// the UI briefly instead of rebooting.
 static inline void wdtHeavyBegin() {
-  if (s_wdt_heavy_depth++ == 0) { disableCore0WDT(); disableCore1WDT(); }
+  if (s_wdt_heavy_depth++ == 0) { disableCore0WDT(); }
 }
 static inline void wdtHeavyEnd() {
-  if (s_wdt_heavy_depth > 0 && --s_wdt_heavy_depth == 0) { enableCore0WDT(); enableCore1WDT(); }
+  if (s_wdt_heavy_depth > 0 && --s_wdt_heavy_depth == 0) { enableCore0WDT(); }
 }
 struct WdtHeavyGuard { WdtHeavyGuard() { wdtHeavyBegin(); } ~WdtHeavyGuard() { wdtHeavyEnd(); } };
 
