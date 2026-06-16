@@ -9920,6 +9920,159 @@ static void calibrateBatteryCb(lv_event_t* e) {
   if (g_lv.task) g_lv.task->showAlert(b, 3000);
 }
 
+// ----- Battery history: 5-minute log to SD + a 24h chart popup (T-Deck only) -----
+// Logging piggybacks the always-on UITask::loop (no extra wakeup): every
+// k_batt_log_period_ms a line is appended to /meshcomod/battery.log and the file
+// is trimmed to the last 24h. The rewrite streams line-by-line via a temp file,
+// so memory cost is one short String at a time. Tapping the battery in the status
+// bar opens a voltage chart built from that file.
+#if defined(HAS_TDECK_GT911)
+static const char*    k_batt_log_path      = "/meshcomod/battery.log";
+static const char*    k_batt_log_tmp       = "/meshcomod/battery.tmp";
+static const uint32_t k_batt_log_period_ms = 5u * 60u * 1000u;   // 5 min
+static const uint32_t k_batt_log_keep_secs = 24u * 60u * 60u;    // 24h window
+static lv_obj_t*      s_batt_chart_root    = nullptr;
+
+// Append one sample + drop anything older than 24h. Line columns (tab-separated,
+// human-readable): <epoch>\t<YYYY-MM-DD HH:MM>\t<millivolts>\t<percent>
+static void batteryLogAppend(uint32_t epoch, uint16_t mv, int pct) {
+  if (SD.cardType() == CARD_NONE) return;
+  markSdIo();
+  char when[20] = "----------------";
+  time_t t = (time_t)epoch; struct tm tmv;
+  if (epoch > 1700000000 && localtime_r(&t, &tmv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tmv);
+  File rf = SD.open(k_batt_log_path, FILE_READ);
+  File wf = SD.open(k_batt_log_tmp, FILE_WRITE);     // truncate/create
+  if (!wf) { if (rf) rf.close(); return; }
+  if (rf) {
+    while (rf.available()) {
+      String ln = rf.readStringUntil('\n');
+      if (ln.length() == 0) continue;
+      const uint32_t e = (uint32_t)strtoul(ln.c_str(), nullptr, 10);
+      if (e != 0 && epoch > e && (epoch - e) > k_batt_log_keep_secs) continue;  // older than 24h
+      wf.print(ln); wf.print('\n');
+    }
+    rf.close();
+  }
+  wf.printf("%lu\t%s\t%u\t%d\n", (unsigned long)epoch, when, (unsigned)mv, pct);
+  wf.close();
+  SD.remove(k_batt_log_path);
+  SD.rename(k_batt_log_tmp, k_batt_log_path);
+}
+
+// Called every UITask::loop tick; rate-limited to k_batt_log_period_ms. No new
+// timer — the UI loop already runs continuously on this always-on device.
+static void batteryLogTick(uint32_t now_ms) {
+  static uint32_t s_next_ms = 0;
+  if (s_next_ms != 0 && (int32_t)(now_ms - s_next_ms) < 0) return;
+  s_next_ms = (now_ms ? now_ms : 1) + k_batt_log_period_ms;
+  const uint16_t mv = batteryMvSmoothed();
+  if (mv == 0) return;                               // no battery reading yet
+  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentFromMv(mv));
+}
+
+static void batteryChartDismissCb(lv_event_t* e) {
+  if (lv_event_get_target(e) != s_batt_chart_root) return;   // backdrop only
+  if (s_batt_chart_root) { lv_obj_del(s_batt_chart_root); s_batt_chart_root = nullptr; }
+}
+
+// Build the 24h battery-voltage chart popup from the SD log.
+static void openBatteryChartWindow() {
+  if (s_batt_chart_root) return;
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_batt_chart_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_batt_chart_root);
+  lv_obj_set_size(s_batt_chart_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_batt_chart_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_batt_chart_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_batt_chart_root, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_clear_flag(s_batt_chart_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_batt_chart_root, batteryChartDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  const lv_coord_t cardw = sw - 24;
+  lv_obj_t* card = lv_obj_create(s_batt_chart_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, cardw, 200);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 8);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text(title, TR("Battery \xe2\x80\x94 last 24h"));
+  lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(title, 0, 0);
+
+  // Read the log into a voltage array (oldest..newest). The file is trimmed to
+  // 24h on write, so reading from the start gives the right window.
+  static const int k_max_pts = 288;   // 24h / 5min
+  static uint16_t mvs[k_max_pts];
+  int n = 0;
+  if (SD.cardType() != CARD_NONE) {
+    markSdIo();
+    File rf = SD.open(k_batt_log_path, FILE_READ);
+    if (rf) {
+      while (rf.available() && n < k_max_pts) {
+        String ln = rf.readStringUntil('\n');
+        if (ln.length() == 0) continue;
+        const int t1 = ln.indexOf('\t');
+        const int t2 = (t1 >= 0) ? ln.indexOf('\t', t1 + 1) : -1;
+        const int t3 = (t2 >= 0) ? ln.indexOf('\t', t2 + 1) : -1;
+        if (t2 < 0 || t3 < 0) continue;
+        const int mv = ln.substring(t2 + 1, t3).toInt();
+        if (mv > 0) mvs[n++] = (uint16_t)mv;
+      }
+      rf.close();
+    }
+  }
+
+  if (n <= 0) {
+    lv_obj_t* empty = lv_label_create(card);
+    lv_label_set_text(empty, TR("No battery history yet.\n\nLogged to /meshcomod/battery.log\nevery 5 minutes."));
+    lv_obj_set_style_text_color(empty, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_style_text_font(empty, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(empty, LV_ALIGN_CENTER, 0, 6);
+    return;
+  }
+
+  lv_obj_t* chart = lv_chart_create(card);
+  lv_obj_set_size(chart, cardw - 20, 128);
+  lv_obj_align(chart, LV_ALIGN_TOP_LEFT, 0, 24);
+  lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(chart, n);
+  lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, 3200, 4700);   // 3.2 V .. 4.7 V
+  lv_chart_set_div_line_count(chart, 5, 0);
+  lv_obj_set_style_bg_color(chart, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(chart, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_set_style_border_opa(chart, LV_OPA_30, LV_PART_MAIN);
+  lv_obj_set_style_border_width(chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);   // line only, no point dots
+  lv_chart_series_t* ser = lv_chart_add_series(chart, lv_color_hex(COLOR_STATUS_OK), LV_CHART_AXIS_PRIMARY_Y);
+  for (int i = 0; i < n; ++i) lv_chart_set_next_value(chart, ser, (lv_coord_t)mvs[i]);
+
+  char sub[72];
+  snprintf(sub, sizeof sub, "now %u.%02u V   %d samples   3.2-4.7 V",
+           (unsigned)(mvs[n-1] / 1000), (unsigned)((mvs[n-1] % 1000) / 10), n);
+  lv_obj_t* sl = lv_label_create(card);
+  lv_label_set_text(sl, sub);
+  lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(sl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+}
+
+static void batteryTapCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openBatteryChartWindow();
+}
+#endif  // HAS_TDECK_GT911
+
 static void refreshHomeBattery() {
   if (!g_lv.task) return;
   uint16_t mv = batteryMvSmoothed();
@@ -21078,6 +21231,18 @@ static void buildGlobalStatusBar() {
   lv_obj_set_style_text_font(g_statusbar.batt_pct, &g_font_12, LV_PART_MAIN);
   lv_obj_align(g_statusbar.batt_pct, LV_ALIGN_RIGHT_MID, -22, 0);
 
+#if defined(HAS_TDECK_GT911)
+  // Tapping the battery (icon or %) opens the 24h battery-history chart. Generous
+  // ext-click area so the small glyphs are easy to hit; the rest of the bar still
+  // routes to statusBarTapCb (control center).
+  lv_obj_add_flag(g_statusbar.batt_icon, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(g_statusbar.batt_icon, 10);
+  lv_obj_add_event_cb(g_statusbar.batt_icon, batteryTapCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_flag(g_statusbar.batt_pct, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(g_statusbar.batt_pct, 10);
+  lv_obj_add_event_cb(g_statusbar.batt_pct, batteryTapCb, LV_EVENT_CLICKED, nullptr);
+#endif
+
   g_statusbar.clock = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.clock, TR("--:--"));
   lv_obj_set_style_text_color(g_statusbar.clock, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
@@ -25595,6 +25760,9 @@ void UITask::loop() {
     }
   }
 
+#if defined(HAS_TDECK_GT911)
+  batteryLogTick((uint32_t)now);   // 5-min battery sample -> /meshcomod/battery.log
+#endif
   versionCheckService(now);   // firmware update check (gear badge + About line)
   refreshSysInfo(now);        // live uptime / heap on the About sub-tab
   wifiScanService();          // draw Wi-Fi scan results when the worker finishes
