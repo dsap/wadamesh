@@ -11858,12 +11858,55 @@ static bool fmIsImage(const char* name) {
   const char* dot = strrchr(name, '.');
   if (!dot) return false;
   return !strcasecmp(dot, ".png")  || !strcasecmp(dot, ".jpg") ||
-         !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".sjpg");
+         !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".sjpg") ||
+         !strcasecmp(dot, ".bmp");
 }
 
 // Defined further down (with the map tile code); used here by the image viewer.
 static uint8_t* decodeJpegToRgb565(const uint8_t* jpeg, size_t jpeg_len,
                                    int* out_w, int* out_h);
+static uint8_t* decodePngToRgb565(const uint8_t* png, size_t png_len,
+                                  int* out_w, int* out_h);
+
+// Minimal BMP -> RGB565 decoder for the image viewer. Handles the common
+// uncompressed layouts: 16-bpp 565 (what our screenshots write) and 24-bpp BGR,
+// both bottom-up and top-down. Returns an lvglPsramAlloc'd buffer (freed via
+// lvglPsramFree), or nullptr on anything unsupported.
+static uint8_t* decodeBmpToRgb565(const uint8_t* bmp, size_t len, int* out_w, int* out_h) {
+  if (len < 54 || bmp[0] != 'B' || bmp[1] != 'M') return nullptr;
+  auto rd32 = [&](size_t o) -> uint32_t {
+    return (uint32_t)bmp[o] | ((uint32_t)bmp[o+1] << 8) | ((uint32_t)bmp[o+2] << 16) | ((uint32_t)bmp[o+3] << 24);
+  };
+  auto rd16 = [&](size_t o) -> uint16_t { return (uint16_t)(bmp[o] | (bmp[o+1] << 8)); };
+  const uint32_t data_off = rd32(10);
+  const int32_t  w        = (int32_t)rd32(18);
+  const int32_t  h_raw    = (int32_t)rd32(22);
+  const uint16_t bpp      = rd16(28);
+  const uint32_t comp     = rd32(30);
+  if (w <= 0 || w > 1024) return nullptr;
+  const bool    top_down = (h_raw < 0);
+  const int32_t h        = top_down ? -h_raw : h_raw;
+  if (h <= 0 || h > 1024)        return nullptr;
+  if (bpp != 16 && bpp != 24)    return nullptr;
+  if (comp != 0 && comp != 3)    return nullptr;          // 0 BI_RGB, 3 BI_BITFIELDS
+  const uint32_t row_bytes = (((uint32_t)w * bpp + 31) / 32) * 4;
+  if ((uint64_t)data_off + (uint64_t)row_bytes * (uint32_t)h > len) return nullptr;
+  uint16_t* out = (uint16_t*)lvglPsramAlloc((size_t)w * (size_t)h * sizeof(uint16_t));
+  if (!out) return nullptr;
+  for (int32_t y = 0; y < h; ++y) {
+    const int32_t  srcrow = top_down ? y : (h - 1 - y);   // BMP rows are bottom-up by default
+    const uint8_t* row    = bmp + data_off + (size_t)srcrow * row_bytes;
+    uint16_t*      dst    = out + (size_t)y * w;
+    if (bpp == 16) {
+      memcpy(dst, row, (size_t)w * 2);                    // assume RGB565 (our screenshots)
+    } else {
+      for (int32_t x = 0; x < w; ++x)                     // 24-bpp stored BGR
+        dst[x] = lv_color_make(row[x*3+2], row[x*3+1], row[x*3+0]).full;
+    }
+  }
+  *out_w = (int)w; *out_h = (int)h;
+  return (uint8_t*)out;
+}
 
 static void fmImageClose() {
   // Sync delete (not async): the lv_img references s_fm_img_buf, so the widget
@@ -11962,24 +12005,22 @@ static void fmOpenImage(const char* name) {
   size_t rd = f.readBytes((char*)enc, sz);
   f.close();
 
-  // This board's lv_png decoder produces RGB565 noise, so PNG can't be shown.
-  // Detect the PNG signature and say so instead of rendering garbage.
-  if (rd >= 4 && enc[0] == 0x89 && enc[1] == 'P' && enc[2] == 'N' && enc[3] == 'G') {
-    free(enc);
-    if (g_lv.task) g_lv.task->showAlert(TR("PNG isn't supported here\nUse a JPEG"), 2600);
-    return;
-  }
-
-  // Decode the JPEG to a full RGB565 buffer up front. LVGL's SJPG decoder only
-  // exposes a line-by-line reader, which a scaled/zoomed lv_img draw can't use
-  // (it needs the whole image in memory) — that renders solid black. Decoding
-  // to a TRUE_COLOR buffer is the same path the map tiles use, and it scales.
+  // Decode to a full RGB565 buffer up front (LVGL's line-by-line readers can't
+  // feed a scaled/zoomed lv_img — that renders black). Route by magic bytes:
+  // PNG -> lodepng, BMP -> our reader, else JPEG (SJPG/TJpgDec). Same TRUE_COLOR
+  // path the map tiles use, so it scales.
   int dw = 0, dh = 0;
-  uint8_t* rgb = decodeJpegToRgb565(enc, rd, &dw, &dh);
+  uint8_t* rgb;
+  if (rd >= 4 && enc[0] == 0x89 && enc[1] == 'P' && enc[2] == 'N' && enc[3] == 'G')
+    rgb = decodePngToRgb565(enc, rd, &dw, &dh);
+  else if (rd >= 2 && enc[0] == 'B' && enc[1] == 'M')
+    rgb = decodeBmpToRgb565(enc, rd, &dw, &dh);
+  else
+    rgb = decodeJpegToRgb565(enc, rd, &dw, &dh);
   free(enc);             // encoded bytes no longer needed once decoded
   if (!rgb || dw <= 0 || dh <= 0) {
     if (rgb) lvglPsramFree(rgb);
-    if (g_lv.task) g_lv.task->showAlert(TR("Can't display image\n(JPEG only, <= 1024 px)"), 2600);
+    if (g_lv.task) g_lv.task->showAlert(TR("Can't display image\n(JPEG/PNG/BMP, <= 1024 px)"), 2600);
     return;
   }
 
