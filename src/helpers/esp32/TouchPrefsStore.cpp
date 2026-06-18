@@ -35,7 +35,7 @@ static bool s_begun = false;
 // short read (→ treat as absent → defaults); `ver` lets later builds add fields.
 static const char* KEY_CFG = "cfg";
 static const uint16_t TOUCH_CFG_MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static const uint8_t  TOUCH_CFG_VER   = 3;   // v2 adds sig_probe_en + sig_poll_min; v3 adds tz_zone
+static const uint8_t  TOUCH_CFG_VER   = 5;   // v2 sig_probe/poll; v3 tz_zone; v4 hide_node_name; v5 map_night/map_zoom
 
 // Defaults (kept identical to the historical per-key defaults).
 static const uint16_t DEFAULT_SCREEN_TIMEOUT_S = 20;
@@ -73,6 +73,9 @@ struct __attribute__((packed)) TouchCfg {
   uint8_t  sig_probe_en;     // signal auto-discover probe on/off (bool) — v2
   uint16_t sig_poll_min;     // minutes between signal probes, 1..1440  — v2
   uint8_t  tz_zone;          // selected time-zone index (0 = Europe/CET)  — v3
+  uint8_t  hide_node_name;   // hide the device name in the status bar + park clock left (bool) — v4
+  uint8_t  map_night;        // invert map tile colours at render time (bool) — v5
+  uint8_t  map_zoom;         // last map zoom level (0 = unset, auto-snap) — v5
 };
 
 static TouchCfg s_cfg;
@@ -122,6 +125,9 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.sig_probe_en  = DEFAULT_SIG_PROBE_EN;
   c.sig_poll_min  = DEFAULT_SIG_POLL_MIN;
   c.tz_zone       = 0;          // 0 = Europe (CET/CEST) — preserves prior behaviour
+  c.hide_node_name = 0;         // default: show the device name
+  c.map_night     = 0;          // default: normal (light) tiles
+  c.map_zoom      = 0;          // 0 = unset -> auto-snap on first map open
 }
 
 // Persist the whole blob using the same end()/begin(RW)/put/end()/begin(RO)
@@ -679,6 +685,36 @@ bool touchPrefsGetTilesFromSd() {
 bool touchPrefsSetTilesFromSd(bool from_sd) {
   if (!s_begun) touchPrefsBegin();
   s_cfg.tiles_from_sd = from_sd ? 1 : 0;
+  return cfgFlush();
+}
+
+bool touchPrefsGetHideNodeName() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.hide_node_name != 0;   // default = show the name
+}
+
+bool touchPrefsSetHideNodeName(bool hide) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.hide_node_name = hide ? 1 : 0;
+  return cfgFlush();
+}
+
+bool touchPrefsGetMapNight() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.map_night != 0;
+}
+bool touchPrefsSetMapNight(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.map_night = on ? 1 : 0;
+  return cfgFlush();
+}
+uint8_t touchPrefsGetMapZoom() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.map_zoom;
+}
+bool touchPrefsSetMapZoom(uint8_t z) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.map_zoom = z;
   return cfgFlush();
 }
 

@@ -80,6 +80,21 @@ bool touchPrefsSetUseMiles(bool use_miles);
 bool touchPrefsGetTilesFromSd();
 bool touchPrefsSetTilesFromSd(bool from_sd);
 
+/** Map night mode: invert tile colours at render time (cache stays untouched).
+ *  Default false. */
+bool touchPrefsGetMapNight();
+bool touchPrefsSetMapNight(bool on);
+
+/** Last map zoom level, persisted so the map reopens where the user left it.
+ *  0 = unset (let the auto-snap pick a level for the available tile pack). */
+uint8_t touchPrefsGetMapZoom();
+bool    touchPrefsSetMapZoom(uint8_t z);
+
+/** Hide the device/profile name in the status bar and move the clock to the
+ *  left where the name used to be. Default false (name shown). */
+bool touchPrefsGetHideNodeName();
+bool touchPrefsSetHideNodeName(bool hide);
+
 /** Store all device data (identity/prefs/contacts/channels) on the SD card under
  *  /meshcomod instead of internal SPIFFS. T-Deck only; read at boot before data
  *  loads, so changing it requires a reboot. Default false (SPIFFS). */

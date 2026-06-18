@@ -57,6 +57,7 @@
 #endif
 #include <Utils.h>
 #include <LvglPsramAlloc.h>   // PSRAM-preferred alloc helpers for the map tile cache
+#include "SnakeGame.h"        // Apps → Snake (self-contained game module)
 
 #if defined(HAS_TOUCH_UI)
   #include <lvgl.h>
@@ -289,6 +290,10 @@ extern "C" const lv_font_t person_font14;   // 14 px — for g_font_14 (chat lis
 #define TOUCH_SYM_PERSON  "\xEF\x80\x87"   /* U+F007 user */
 #define TOUCH_SYM_ANTENNA "\xEF\x94\x99"   /* U+F519 tower-broadcast */
 #define TOUCH_SYM_GROUP   "\xEF\x83\x80"   /* U+F0C0 users (group) */
+// FontAwesome "magnifying-glass" (U+F002), 16 px — for the map zoom button. Its
+// own one-glyph font, spliced into the g_font_16 fallback chain like person_font.
+extern "C" const lv_font_t zoom_font;
+#define TOUCH_SYM_ZOOM    "\xEF\x80\x82"   /* U+F002 magnifying-glass */
 
 // Extras fallback fonts — em-dash (U+2014), ellipsis (U+2026), middle dot
 // (U+00B7). LVGL's stock Montserrat subset doesn't include these, so any
@@ -353,6 +358,12 @@ static void initTouchFontFallbacks() {
   s_person_font = person_font;
   s_person_font.fallback = g_font_16.fallback;
   g_font_16.fallback = &s_person_font;
+  // Map zoom magnifier (U+F002) — head of the g_font_16 chain (overlay buttons
+  // render in g_font_16). One PUA codepoint; misses on it are free for plain text.
+  static lv_font_t s_zoom_font;
+  s_zoom_font = zoom_font;
+  s_zoom_font.fallback = g_font_16.fallback;
+  g_font_16.fallback = &s_zoom_font;
   // Also reach the person/antenna/group glyphs from g_font_14 — the contact
   // action sheet title and the Chats-list rows render the icon inline with 14 px
   // text. Use the 14 px-rendered person_font14 (NOT the 16 px person_font) so the
@@ -551,6 +562,8 @@ struct GlobalStatusBar {
   lv_obj_t* left_label;
   lv_obj_t* conn_icon;       // Wi-Fi glyph
   lv_obj_t* ble_icon;        // Bluetooth glyph (separate from Wi-Fi)
+  lv_obj_t* sd_icon;         // microSD read/write activity LED (left of Wi-Fi)
+  lv_obj_t* async_icon;      // async mesh-request spinner glyph (centre, transient)
   lv_obj_t* clock;
   lv_obj_t* batt_pct;
   lv_obj_t* batt_icon;
@@ -561,6 +574,26 @@ struct GlobalStatusBar {
 };
 static GlobalStatusBar g_statusbar = {};
 static void updateGlobalStatusBar();   // fwd decl, called from refresh tick
+
+// microSD read/write activity. markSdIo() stamps the time of the last SD access
+// (SD-backed tile cache, SD tile packs, file manager, mount). UITask::loop lights
+// a small LED in the status bar for a short window after each access. Cost on the
+// hot path is one 32-bit timestamp store; the loop toggle is edge-triggered so it
+// only touches LVGL when the lit/dark state actually flips. Written from both
+// cores (core-0 fetch task + core-1 UI) — an aligned word store is atomic on the
+// S3, and a stale read only ever mistimes the LED by a frame, which is harmless.
+static volatile uint32_t g_sd_io_ms = 0;
+static inline void markSdIo() { const uint32_t t = millis(); g_sd_io_ms = t ? t : 1; }
+
+// Async mesh-request activity: a small spinner glyph in the status bar while a
+// request is sending or awaiting a reply. markMeshRequest() stamps a send; the
+// indicator also stays lit while a UI reply is pending (s_ui_ping_deadline_ms,
+// telemetry/ping) or the sightline worker is busy (s_los_busy).
+static volatile uint32_t g_mesh_req_ms = 0;
+static inline void markMeshRequest() { const uint32_t t = millis(); g_mesh_req_ms = t ? t : 1; }
+// How long the LED stays lit after the last SD access (ms). Long enough that a
+// single quick read is visible, short enough to read as "activity" not "on".
+static constexpr uint32_t k_sd_io_led_ms = 180;
 
 // Active chat thread name, surfaced in the status bar's left zone. The in-chat
 // header bar (back button + name) was removed to give the conversation the full
@@ -1407,11 +1440,31 @@ static void addCloseXBadge(lv_obj_t* card, lv_event_cb_t cb, void* user_data = n
 // ============================================================
 // Display / input drivers
 // ============================================================
+// Screenshot capture: when g_shot_buf is set, lvglFlush mirrors every flushed
+// area into this full-screen RGB565 buffer (in addition to the panel write), so a
+// forced full redraw fills it with the composited screen. Only live during a shot.
+static lv_color_t* g_shot_buf = nullptr;
+static int         g_shot_w   = 0;
+static int         g_shot_h   = 0;
+
 static void lvglFlush(lv_disp_drv_t* disp_drv, const lv_area_t* area, lv_color_t* color_p) {
   (void)disp_drv;
   int32_t w = area->x2 - area->x1 + 1;
   int32_t h = area->y2 - area->y1 + 1;
   display.writePixelsRGB565(area->x1, area->y1, w, h, reinterpret_cast<uint16_t*>(color_p));
+  if (g_shot_buf) {                       // mirror this area into the screenshot buffer
+    for (int32_t row = 0; row < h; ++row) {
+      const int32_t dy = area->y1 + row;
+      if (dy < 0 || dy >= g_shot_h) continue;
+      int32_t x0 = area->x1, cw = w;
+      if (x0 < 0) { cw += x0; x0 = 0; }
+      if (x0 + cw > g_shot_w) cw = g_shot_w - x0;
+      if (cw > 0)
+        memcpy(g_shot_buf + (size_t)dy * g_shot_w + x0,
+               color_p + (size_t)row * w + (x0 - area->x1),
+               (size_t)cw * sizeof(lv_color_t));
+    }
+  }
   lv_disp_flush_ready(disp_drv);
 }
 
@@ -5495,6 +5548,34 @@ static void sysInfoText(char* buf, size_t cap) {
                 (unsigned)(sketch_size / 1024u),
                 (unsigned)(sketch_free / 1024u));
 
+#if defined(HAS_TDECK_GT911)
+  // microSD size + free. usedBytes() scans the FAT (slow on a big card), and
+  // sysInfoText runs ~1 Hz while the About sheet is open — so the result is
+  // cached ~30 s rather than recomputed every refresh.
+  {
+    static uint32_t sd_stat_ms = 0;
+    static uint64_t sd_tot = 0, sd_free = 0;
+    static bool     sd_ok = false;
+    const uint32_t nowm = millis();
+    if (sd_stat_ms == 0 || (uint32_t)(nowm - sd_stat_ms) >= 30000) {
+      sd_stat_ms = nowm ? nowm : 1;
+      if (SD.cardType() != CARD_NONE) {
+        const uint64_t t = SD.totalBytes(), u = SD.usedBytes();
+        sd_tot = t; sd_free = (t > u) ? (t - u) : 0; sd_ok = (t > 0);
+      } else {
+        sd_ok = false;
+      }
+    }
+    if (sd_ok)
+      p += snprintf(buf + p, cap - p,
+                    "microSD\n  size: %llu MB\n  free: %llu MB\n\n",
+                    (unsigned long long)(sd_tot  / (1024ull * 1024ull)),
+                    (unsigned long long)(sd_free / (1024ull * 1024ull)));
+    else
+      p += snprintf(buf + p, cap - p, "microSD\n  not mounted\n\n");
+  }
+#endif
+
   // NVS usage across the whole 'nvs' partition (shared by Wi-Fi creds, the
   // Launcher, and our settings). Near-100% is what triggers the boot loop.
   nvs_stats_t nvs{};
@@ -5512,6 +5593,10 @@ static void sysInfoText(char* buf, size_t cap) {
   p += snprintf(buf + p, cap - p,
                 "Build\n  %s\n  %s\n  WADAMESH TOUCH\n",
                 FIRMWARE_VERSION, FIRMWARE_BUILD_DATE);
+#if defined(WADAMESH_FORK_BUILD)
+  // Defined in platformio.ini for this fork's builds; absent upstream.
+  p += snprintf(buf + p, cap - p, "  unofficial fork build\n");
+#endif
   (void)p;
 }
 
@@ -5566,6 +5651,9 @@ static void buildSystemInfoSettings() {
 // Map tile source: false = tile server + on-device cache, true = read tiles off the microSD.
 // The toggle + its callback (mapOptTilesSdCb) live in the map options popup, further down.
 static bool s_tiles_from_sd = false;
+// Map night mode: invert tile colours at render time only (the cached JPEG/PNG is
+// never altered). Loaded from prefs at boot; toggled in the map options popup.
+static bool s_map_night = false;
 
 // Distance units toggle (km <-> miles). Applies immediately — saves the
 // pref and forces the contacts list to re-render its distance badges.
@@ -5653,6 +5741,18 @@ static void scrollReverseToggleCb(lv_event_t* e) {
   if (g_lv.task) g_lv.task->showAlert(on ? TR("Scrollball: reversed") : TR("Scrollball: normal"), 900);
 }
 #endif
+
+// Hide the device/profile name in the status bar and park the clock on the left
+// where the name used to be. Applies immediately via updateGlobalStatusBar().
+static void hideNameToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool hide = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetHideNodeName(hide);
+#endif
+  updateGlobalStatusBar();   // hide/show the name + reposition the clock now
+  if (g_lv.task) g_lv.task->showAlert(hide ? TR("Device name hidden") : TR("Device name shown"), 1000);
+}
 
 // Colourful chat bubbles toggle. On enable: the "taste the rainbow" easter egg.
 // Bubbles recolour the next time a chat opens (this control lives on Settings).
@@ -6083,6 +6183,19 @@ static void buildDeviceSettings(int sec) {
     if (touchPrefsGetColorfulBubbles()) lv_obj_add_state(sw, LV_STATE_CHECKED);
 #endif
     lv_obj_add_event_cb(sw, colorfulBubblesToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(40, h + 12);
+  }
+
+  /* Hide device name: blank the scrolling profile name in the status bar and
+     move the clock to the left where it sat. */
+  {
+    int h = settingsRowLabel(body, y, 6, "Hide device name", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetHideNodeName()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, hideNameToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(40, h + 12);
   }
 
@@ -7470,6 +7583,20 @@ static void actionSheetSendMsgCb(lv_event_t* e) {
 // "No reply from <name>" toast and cancel the_mesh's pending slot.
 static unsigned long s_ui_ping_deadline_ms = 0;
 static char s_ui_ping_target_name[24] = {0};
+
+// ---- Telemetry window state (window + auto-poll defined further down) ----
+enum { TELEM_IN_PROGRESS = 0, TELEM_RECEIVED, TELEM_FAILED, TELEM_HISTORY };
+static uint8_t  s_telem_node[6] = {0};
+static char     s_telem_name[24] = {0};
+static char     s_telem_reading[140] = {0};    // latest decoded reading line
+static int      s_telem_state = TELEM_HISTORY;
+static bool     s_telem_manual_pending = false; // a manual request is awaiting its reply
+static uint32_t s_telem_deadline_ms = 0;        // manual-request timeout (separate from ping)
+static int      s_telem_win_now_h  = 0;         // display window: newer bound (hours ago)
+static int      s_telem_win_past_h = 24;        // display window: older bound (hours ago)
+#if defined(HAS_TDECK_GT911)
+static void openTelemetryWindow(const uint8_t* key6, const char* name, int state);   // fwd
+#endif
 static constexpr unsigned long UI_PING_TIMEOUT_MS = 30000;  // 30 s for flood paths
 
 static void actionSheetPingCb(lv_event_t* e) {
@@ -7542,22 +7669,24 @@ static void actionSheetTelemetryCb(lv_event_t* e) {
   bool ok = the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c);
   closeActionSheet();
   if (!ok) { g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
-  // Chain a guest LOGIN ahead of the telemetry REQ — same reason as ping:
-  // repeaters & sensors require us in their ACL before they will decrypt a
-  // PAYLOAD_TYPE_REQ. See sendStatusPingWithGuestLoginForUI for the full
-  // explanation.
+#if defined(HAS_TDECK_GT911)
+  // Open the telemetry window on its history; it does NOT auto-request. The user
+  // taps the Request button (refresh glyph, left of the gear) to poll.
+  memcpy(s_telem_node, c.id.pub_key, 6);
+  copyUtf8ReplacingMissingGlyphs(&g_font_14, s_telem_name, sizeof s_telem_name, c.name[0] ? c.name : "node");
+  s_telem_reading[0] = '\0';
+  s_telem_manual_pending = false;
+  openTelemetryWindow(s_telem_node, s_telem_name, TELEM_HISTORY);
+#else
+  // No telemetry window on this board — send straight away and toast the result.
+  // Chain a guest LOGIN ahead of the REQ (repeaters/sensors need us in their ACL
+  // before they decrypt a PAYLOAD_TYPE_REQ; see sendStatusPingWithGuestLoginForUI).
   int r = the_mesh.sendTelemetryRequestWithGuestLoginForUI(c);
-  if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
-    copyUtf8ReplacingMissingGlyphs(&g_font_14, s_ui_ping_target_name,
-                                    sizeof(s_ui_ping_target_name),
-                                    c.name[0] ? c.name : "node");
-    s_ui_ping_deadline_ms = millis() + UI_PING_TIMEOUT_MS;
-    g_lv.task->showAlert(r == MSG_SEND_SENT_DIRECT
-                         ? TR("Telemetry req (direct)…")
-                         : TR("Telemetry req (flood)…"), 1400);
-  } else {
+  if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT)
+    g_lv.task->showAlert(TR("Telemetry req\xe2\x80\xa6"), 1400);
+  else
     g_lv.task->showAlert(TR("Telemetry req failed"), 1200);
-  }
+#endif
 }
 
 // ---- Repeater admin console (login + CLI passthrough) ----------------------
@@ -8024,6 +8153,7 @@ static void adminPwSubmitCb(lv_event_t* e) {
                               lv_obj_has_state(s_admin_pw_remember, LV_STATE_CHECKED));
   int r = the_mesh.uiSendAdminLogin(*c, s_admin_pw_attempt);
   if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+    markMeshRequest();   // status-bar async spinner
     if (g_lv.task) g_lv.task->showAlert(TR("Logging in\xe2\x80\xa6"), 1500);
   } else {
     if (g_lv.task) g_lv.task->showAlert(TR("Send failed"), 1200);
@@ -8251,6 +8381,7 @@ static void actionSheetTracePingCb(lv_event_t* e) {
   if (tag == 0) {
     g_lv.task->showAlert(TR("Trace failed"), 1200);
   } else {
+    markMeshRequest();   // status-bar async spinner
     g_lv.task->showAlert(TR("Trace sent\xe2\x80\xa6"), 1200);
   }
 }
@@ -8268,6 +8399,7 @@ static void actionSheetRangeTestCb(lv_event_t* e) {
   uint32_t ack_hash = 0;
   int r = the_mesh.sendMessage(c, ts, 0, "RangeTest \xe2\x80\x94 ACK?", ack_hash, est, &hash4);
   if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+    markMeshRequest();   // status-bar async spinner
     g_lv.task->showAlert(r == MSG_SEND_SENT_DIRECT ? TR("RangeTest sent (direct)")
                                                    : TR("RangeTest sent (flood)"), 1400);
   } else {
@@ -8842,6 +8974,7 @@ static void actionSheetLosCb(lv_event_t* e) {
 }
 #endif  // ESP32 && MULTI_TRANSPORT_COMPANION
 
+static void actionSheetShowOnMapCb(lv_event_t* e);   // defined with the map code (uses map statics)
 static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const char* name, bool from_map = false) {
   s_action_sheet_mesh_idx = mesh_idx;
   s_action_sheet_is_repeater = is_repeater;
@@ -8981,6 +9114,13 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     mk_btn(LV_SYMBOL_ENVELOPE "  Message", actionSheetSendMsgCb, 0);
   }
   mk_btn(LV_SYMBOL_BATTERY_3 "  Telemetry", actionSheetTelemetryCb, 0);
+  // Show on map — only when the contact has a location, and not when the sheet
+  // was opened from the map (you're already there).
+  if (!from_map) {
+    ContactInfo _mc;
+    if (the_mesh.getContactByIdx(s_action_sheet_mesh_idx, _mc) && (_mc.gps_lat != 0 || _mc.gps_lon != 0))
+      mk_btn(LV_SYMBOL_GPS "  Show on map", actionSheetShowOnMapCb, 0);
+  }
   if (is_repeater) {
     mk_btn(LV_SYMBOL_GPS      "  Trace SNR", actionSheetTracePingCb, 0);
     mk_btn(LV_SYMBOL_SETTINGS "  Admin",     actionSheetAdminCb,     0);
@@ -9938,6 +10078,391 @@ static void calibrateBatteryCb(lv_event_t* e) {
   if (g_lv.task) g_lv.task->showAlert(b, 3000);
 }
 
+// ----- Battery history: 5-minute log to SD + a 24h chart popup (T-Deck only) -----
+// Logging piggybacks the always-on UITask::loop (no extra wakeup): every
+// k_batt_log_period_ms a line is appended to /meshcomod/battery.log and the file
+// is trimmed to the last 24h. The rewrite streams line-by-line via a temp file,
+// so memory cost is one short String at a time. Tapping the battery in the status
+// bar opens a voltage chart built from that file.
+// Battery log prefers the SD card when present (T-Deck); on boards with no SD
+// slot — or a T-Deck with no card inserted — it falls back to internal SPIFFS so
+// the 24h chart still works. SD path lives under /meshcomod with the other files;
+// SPIFFS (flat) uses a top-level path.
+static fs::FS& battLogFs() {
+#if defined(HAS_TDECK_GT911)
+  if (SD.cardType() != CARD_NONE) return SD;
+#endif
+  return SPIFFS;
+}
+static bool battLogOnSd() {
+#if defined(HAS_TDECK_GT911)
+  return SD.cardType() != CARD_NONE;
+#else
+  return false;
+#endif
+}
+static const char* battLogPath() { return battLogOnSd() ? "/meshcomod/battery.log" : "/battery.log"; }
+static const char* battLogTmp()  { return battLogOnSd() ? "/meshcomod/battery.tmp" : "/battery.tmp"; }
+static const uint32_t k_batt_log_period_ms = 5u * 60u * 1000u;   // 5 min
+static const uint32_t k_batt_log_keep_secs = 24u * 60u * 60u;    // 24h window
+static lv_obj_t*      s_batt_chart_root    = nullptr;
+
+// Append one sample + drop anything older than 24h. Line columns (tab-separated,
+// human-readable): <epoch>\t<YYYY-MM-DD HH:MM>\t<millivolts>\t<percent>\t<cpuMHz>
+static void batteryLogAppend(uint32_t epoch, uint16_t mv, int pct, uint16_t cpu_mhz) {
+  fs::FS& fs = battLogFs();
+  if (battLogOnSd()) markSdIo();
+  char when[20] = "----------------";
+  time_t t = (time_t)epoch; struct tm tmv;
+  if (epoch > 1700000000 && localtime_r(&t, &tmv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tmv);
+  File rf = fs.open(battLogPath(), FILE_READ);
+  File wf = fs.open(battLogTmp(), FILE_WRITE);     // truncate/create
+  if (!wf) { if (rf) rf.close(); return; }
+  if (rf) {
+    while (rf.available()) {
+      String ln = rf.readStringUntil('\n');
+      if (ln.length() == 0) continue;
+      const uint32_t e = (uint32_t)strtoul(ln.c_str(), nullptr, 10);
+      if (e != 0 && epoch > e && (epoch - e) > k_batt_log_keep_secs) continue;  // older than 24h
+      wf.print(ln); wf.print('\n');
+    }
+    rf.close();
+  }
+  wf.printf("%lu\t%s\t%u\t%d\t%u\n", (unsigned long)epoch, when, (unsigned)mv, pct, (unsigned)cpu_mhz);
+  wf.close();
+  fs.remove(battLogPath());
+  fs.rename(battLogTmp(), battLogPath());
+}
+
+// Called every UITask::loop tick; rate-limited to k_batt_log_period_ms. No new
+// timer — the UI loop already runs continuously on this always-on device.
+static void batteryLogTick(uint32_t now_ms) {
+  static uint32_t s_next_ms = 0;
+  if (s_next_ms != 0 && (int32_t)(now_ms - s_next_ms) < 0) return;
+  s_next_ms = (now_ms ? now_ms : 1) + k_batt_log_period_ms;
+  const uint16_t mv = batteryMvSmoothed();
+  if (mv == 0) return;                               // no battery reading yet
+  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentFromMv(mv),
+                   (uint16_t)getCpuFrequencyMhz());
+}
+
+static void batteryChartClose() {
+  if (s_batt_chart_root) { lv_obj_del(s_batt_chart_root); s_batt_chart_root = nullptr; }
+}
+static void batteryChartDismissCb(lv_event_t* e) {
+  if (lv_event_get_target(e) != s_batt_chart_root) return;   // backdrop only
+  batteryChartClose();
+}
+static void batteryChartCloseCb(lv_event_t* e) { (void)e; batteryChartClose(); }  // the X badge
+static void openBatteryChartWindow();   // fwd (clear reopens to show the empty chart)
+static void batteryLogClearConfirmed() {
+  if (battLogOnSd()) markSdIo();
+  battLogFs().remove(battLogPath());
+  batteryChartClose();
+  openBatteryChartWindow();
+}
+static void batteryClearCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  showConfirm(TR("Clear battery history?"), TR("Clear"), batteryLogClearConfirmed);
+}
+static bool s_batt_show_cpu = true;   // chart: draw the CPU-MHz series (session-scoped)
+static void batteryCpuToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  s_batt_show_cpu = !s_batt_show_cpu;
+  batteryChartClose();
+  openBatteryChartWindow();          // redraw immediately with the new visibility
+}
+
+// Build the 24h battery-voltage chart popup from the SD log.
+// Reformat the battery chart's primary-Y axis ticks from raw millivolts to volts
+// (e.g. 4200 -> "4.2"). Secondary-Y (CPU MHz) keeps the raw number. RF-monitor
+// pattern: hook DRAW_PART_BEGIN and rewrite the tick label buffer.
+static void battChartTickCb(lv_event_t* e) {
+  lv_obj_draw_part_dsc_t* dsc = lv_event_get_draw_part_dsc(e);
+  if (!lv_obj_draw_part_check_type(dsc, &lv_chart_class, LV_CHART_DRAW_PART_TICK_LABEL)) return;
+  if (dsc->text == nullptr) return;
+  if (dsc->id == LV_CHART_AXIS_PRIMARY_Y)
+    lv_snprintf(dsc->text, dsc->text_length, "%d.%01d",
+                (int)(dsc->value / 1000), (int)((dsc->value % 1000) / 100));
+}
+// Estimate remaining battery life from the logged samples. Charging samples
+// (mv > calibrated full) are ignored, and only the discharge segment AFTER the
+// most recent charge is used. A least-squares slope over that segment gives
+// mV/s; time-to-empty targets 3300 mV (the Li-ion empty point used by the % curve).
+static void batteryEstimateText(const uint32_t* eps, const uint16_t* mvs, int n,
+                                int full_mv, char* out, size_t cap) {
+  int start = 0;
+  for (int i = 1; i < n; ++i) {
+    if ((int)mvs[i] > full_mv)                   start = i + 1;   // charging spike -> resume after
+    else if ((int)mvs[i] - (int)mvs[i - 1] >= 25) start = i;      // a >=25 mV rise = charge event
+  }
+  double sx = 0, sy = 0, sxx = 0, sxy = 0; int m = 0;
+  uint32_t t0 = 0, last_t = 0; int last_v = 0;
+  for (int i = start; i < n; ++i) {
+    if ((int)mvs[i] > full_mv) continue;         // skip any charging spikes in the window
+    if (m == 0) t0 = eps[i];
+    const double x = (double)(eps[i] - t0), y = (double)mvs[i];
+    sx += x; sy += y; sxx += x * x; sxy += x * y; ++m; last_v = mvs[i]; last_t = eps[i];
+  }
+  if (m < 3 || (last_t - t0) < 900) { snprintf(out, cap, "Battery life: gathering data\xe2\x80\xa6"); return; }
+  const double denom = (double)m * sxx - sx * sx;
+  if (denom <= 0) { snprintf(out, cap, "Battery life: \xe2\x80\x94"); return; }
+  const double slope = ((double)m * sxy - sx * sy) / denom;   // mV/s (negative = discharging)
+  if (slope >= -1e-7) { snprintf(out, cap, "Battery life: charging / steady"); return; }
+  double secs = (double)(last_v - 3300) / (-slope);
+  if (secs < 0) secs = 0;
+  long s = (long)secs;
+  const int d = (int)(s / 86400); s %= 86400;
+  const int h = (int)(s / 3600);  s %= 3600;
+  const int mn = (int)(s / 60);
+  snprintf(out, cap, "Est. life: %dd %dh %dm", d, h, mn);
+}
+static void openBatteryChartWindow() {
+  if (s_batt_chart_root) return;
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_batt_chart_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_batt_chart_root);
+  lv_obj_set_size(s_batt_chart_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_batt_chart_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_batt_chart_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_batt_chart_root, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_clear_flag(s_batt_chart_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_batt_chart_root, batteryChartDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  const lv_coord_t cardw = sw - 24;
+  lv_obj_t* card = lv_obj_create(s_batt_chart_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, cardw, LV_SIZE_CONTENT);                       // grow to content...
+  lv_obj_set_style_max_height(card, sh - STATUSBAR_H - 16, LV_PART_MAIN);  // ...and scroll past the screen
+  lv_obj_set_style_min_height(card, 120, LV_PART_MAIN);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 8);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  addCloseXBadge(card, batteryChartCloseCb);   // universal top-right X
+
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text(title, TR("Battery \xe2\x80\x94 last 24h"));
+  lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(title, 0, 0);
+
+  // Read the log into voltage + cpu arrays (oldest..newest). The file is trimmed
+  // to 24h on write, so reading from the start gives the right window. cpu is the
+  // 5th column (absent in pre-upgrade lines -> 0, drawn as a gap).
+  static const int k_max_pts = 288;   // 24h / 5min
+  static uint16_t mvs[k_max_pts];
+  static uint16_t cpus[k_max_pts];
+  static uint32_t eps[k_max_pts];
+  int n = 0;
+  {
+    if (battLogOnSd()) markSdIo();
+    File rf = battLogFs().open(battLogPath(), FILE_READ);
+    if (rf) {
+      while (rf.available() && n < k_max_pts) {
+        String ln = rf.readStringUntil('\n');
+        if (ln.length() == 0) continue;
+        const int t1 = ln.indexOf('\t');
+        const int t2 = (t1 >= 0) ? ln.indexOf('\t', t1 + 1) : -1;
+        const int t3 = (t2 >= 0) ? ln.indexOf('\t', t2 + 1) : -1;
+        if (t2 < 0 || t3 < 0) continue;
+        const int t4 = ln.indexOf('\t', t3 + 1);
+        const int mv = ln.substring(t2 + 1, t3).toInt();
+        if (mv <= 0) continue;
+        eps[n]  = (uint32_t)strtoul(ln.c_str(), nullptr, 10);   // first column = epoch
+        mvs[n]  = (uint16_t)mv;
+        cpus[n] = (uint16_t)((t4 >= 0) ? ln.substring(t4 + 1).toInt() : 0);
+        ++n;
+      }
+      rf.close();
+    }
+  }
+
+  if (n <= 0) {
+    lv_obj_t* empty = lv_label_create(card);
+    lv_label_set_text(empty, TR("No battery history yet.\n\nLogged every 5 minutes."));
+    lv_obj_set_style_text_color(empty, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_style_text_font(empty, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_pos(empty, 0, 28);
+    return;
+  }
+
+  // Battery range: bottom 3.4 V, top = calibrated 100% (Settings). Charging can
+  // push the rail above the calibrated full (up to ~4.7 V) — clamp those samples
+  // to y_top so the line rides along the chart's maximum instead of vanishing.
+  const uint16_t full_mv = batteryFullMv();
+  const lv_coord_t y_top = (lv_coord_t)(full_mv < 3500 ? 4200 : full_mv);
+  const lv_coord_t y_bot = 3400;
+  // Inset for the axis-label gutters (V left, MHz right) — RF-monitor style.
+  const int chart_x = 30, chart_rpad = 30, chart_y = 18, chart_h = 122;
+  lv_obj_t* chart = lv_chart_create(card);
+  lv_obj_set_size(chart, cardw - 20 - chart_x - chart_rpad, chart_h);
+  lv_obj_set_pos(chart, chart_x, chart_y);
+  lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(chart, n);
+  lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y,   y_bot, y_top);   // 3.4 V .. calibrated full (blue)
+  lv_chart_set_div_line_count(chart, 4, 6);          // helper grid: 4 horizontal, 6 vertical
+  lv_obj_set_style_bg_color(chart, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(chart, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_line_color(chart, lv_color_hex(0x1A1D1F), LV_PART_MAIN);   // faint grid lines
+  lv_obj_set_style_size(chart, 4, LV_PART_INDICATOR);                         // visible point dots
+  // Axis ticks + labels (RF-monitor style): primary Y reformatted to volts by the
+  // draw callback, secondary Y shows raw MHz. Reserve a label gutter on each side.
+  lv_obj_set_style_pad_top(chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_text_font(chart, &g_font_12, LV_PART_TICKS);
+  lv_obj_set_style_text_color(chart, lv_color_hex(COLOR_SUB), LV_PART_TICKS);
+  lv_obj_set_style_line_color(chart, lv_color_hex(0x2A2E30), LV_PART_TICKS);
+  lv_obj_set_style_pad_left(chart, 4, LV_PART_TICKS);
+  lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_Y,   4, 0, 4, 1, true, 40);
+  lv_obj_add_event_cb(chart, battChartTickCb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
+  lv_chart_series_t* vser = lv_chart_add_series(chart, lv_color_hex(0x4F9DF7), LV_CHART_AXIS_PRIMARY_Y);   // blue battery
+  // CPU MHz series is optional (toggled by the "CPU" chip next to the trash button).
+  lv_chart_series_t* cser = nullptr;
+  if (s_batt_show_cpu) {
+    lv_chart_set_range(chart, LV_CHART_AXIS_SECONDARY_Y, 60, 260);                     // CPU MHz (orange)
+    lv_chart_set_axis_tick(chart, LV_CHART_AXIS_SECONDARY_Y, 4, 0, 4, 1, true, 40);
+    cser = lv_chart_add_series(chart, lv_color_hex(0x4A5256), LV_CHART_AXIS_SECONDARY_Y); // grey CPU (RF-monitor noise-floor tone)
+  }
+  for (int i = 0; i < n; ++i) {
+    lv_coord_t v = (lv_coord_t)mvs[i];
+    if (v > y_top) v = y_top;             // charging spike -> ride the top line
+    if (v < y_bot) v = y_bot;
+    lv_chart_set_next_value(chart, vser, v);
+    if (cser) lv_chart_set_next_value(chart, cser, cpus[i] > 0 ? (lv_coord_t)cpus[i] : LV_CHART_POINT_NONE);
+  }
+
+  // Time labels on the X (the tick mechanism counts points, not hours).
+  auto x_lbl = [&](const char* txt, lv_align_t al) {
+    lv_obj_t* l = lv_label_create(card);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_align_to(l, chart, al, 0, 2);
+  };
+  x_lbl("-24h", LV_ALIGN_OUT_BOTTOM_LEFT);
+  x_lbl("now",  LV_ALIGN_OUT_BOTTOM_RIGHT);
+
+  // ---- Bottom block (running y, top-down so nothing overlaps; the card scrolls
+  // if it overflows the screen). Text capped to clear the CPU + trash buttons. ----
+  int by = chart_y + chart_h + 18;     // below the chart + its x-axis labels
+  const int row_y = by;                // buttons ride to the right of this block
+  const lv_coord_t btxt_w = cardw - 20 - 72;
+
+  // estimate (accent headline)
+  char est[44];
+  batteryEstimateText(eps, mvs, n, (int)full_mv, est, sizeof est);
+  lv_obj_t* el = lv_label_create(card);
+  lv_label_set_text(el, est);
+  lv_obj_set_style_text_font(el, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(el, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_set_width(el, btxt_w);
+  lv_label_set_long_mode(el, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(el, 0, by);
+  by += 28;   // clear the 26-px CPU/trash button row before the full-width stats line
+
+  // stats
+  char sub[72];
+  if (s_batt_show_cpu)
+    snprintf(sub, sizeof sub, "now %u.%02u V (full %u.%01u)   CPU %u MHz",
+             (unsigned)(mvs[n-1] / 1000), (unsigned)((mvs[n-1] % 1000) / 10),
+             (unsigned)(y_top / 1000), (unsigned)((y_top % 1000) / 100),
+             (unsigned)getCpuFrequencyMhz());
+  else
+    snprintf(sub, sizeof sub, "now %u.%02u V (full %u.%01u)",
+             (unsigned)(mvs[n-1] / 1000), (unsigned)((mvs[n-1] % 1000) / 10),
+             (unsigned)(y_top / 1000), (unsigned)((y_top % 1000) / 100));
+  lv_obj_t* sl = lv_label_create(card);
+  lv_label_set_text(sl, sub);
+  lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_width(sl, cardw - 20);          // full width — its row has no buttons, so "MHz" never wraps
+  lv_label_set_long_mode(sl, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(sl, 0, by);
+  by += 18;
+
+  // points count
+  lv_obj_t* pl = lv_label_create(card);
+  lv_label_set_text_fmt(pl, "%d pts", n);
+  lv_obj_set_style_text_font(pl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(pl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(pl, 0, by);
+  by += 18;
+
+  // Clear the battery history (with confirmation) — to the right of the text block.
+  lv_obj_t* clr = lv_btn_create(card);
+  lv_obj_set_size(clr, 30, 26);
+  lv_obj_align(clr, LV_ALIGN_TOP_RIGHT, 0, row_y);
+  lv_obj_set_style_bg_color(clr, lv_color_hex(0xB23A48), LV_PART_MAIN);
+  lv_obj_add_event_cb(clr, batteryClearCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* clrl = lv_label_create(clr); lv_label_set_text(clrl, LV_SYMBOL_TRASH); lv_obj_center(clrl);
+
+  // Show/hide the CPU-MHz series (same size/style as the trash button, to its left).
+  lv_obj_t* cpub = lv_btn_create(card);
+  lv_obj_set_size(cpub, 30, 26);
+  lv_obj_align(cpub, LV_ALIGN_TOP_RIGHT, -36, row_y);
+  lv_obj_set_style_pad_all(cpub, 0, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(cpub, lv_color_hex(s_batt_show_cpu ? 0x4A5256 : 0x3A3D40), LV_PART_MAIN);
+  lv_obj_add_event_cb(cpub, batteryCpuToggleCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cpul = lv_label_create(cpub);
+  lv_label_set_text(cpul, "CPU");
+  lv_obj_set_style_text_font(cpul, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(cpul, lv_color_hex(s_batt_show_cpu ? 0xFFFFFF : COLOR_SUB), LV_PART_MAIN);
+  lv_obj_center(cpul);
+}
+
+static void batteryTapCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openBatteryChartWindow();
+}
+
+#if defined(HAS_TDECK_GT911)
+// ----- Per-node telemetry log (/meshcomod/telemetry/<id>.log) -----
+// One file per node (6-byte pubkey prefix, hex). Columns (tab-separated):
+//   epoch \t YYYY-MM-DD HH:MM \t battery_mv \t tempC*10 \t humidity%
+// Missing sensors use sentinels (mv=0, t10=-30000, hum=-1) -> drawn as gaps.
+// Trimmed to a 7-day window via a streaming temp-file rewrite (like battery.log).
+// SD-backed (T-Deck only); telemetry on V4 stays request/reply-only (a toast).
+static const uint32_t k_telem_keep_secs = 7u * 24u * 60u * 60u;
+static void telemetryNodePath(const uint8_t* key, char* out, size_t cap) {
+  snprintf(out, cap, "/meshcomod/telemetry/%02X%02X%02X%02X%02X%02X.log",
+           key[0], key[1], key[2], key[3], key[4], key[5]);
+}
+static void telemetryLogAppend(const uint8_t* key, uint32_t epoch, int mv, int t10, int hum) {
+  if (SD.cardType() == CARD_NONE) return;
+  markSdIo();
+  SD.mkdir("/meshcomod");
+  SD.mkdir("/meshcomod/telemetry");
+  char path[48]; telemetryNodePath(key, path, sizeof path);
+  const char* tmp = "/meshcomod/telemetry/_t.tmp";
+  char when[20] = "----------------"; time_t t = (time_t)epoch; struct tm tmv;
+  if (epoch > 1700000000 && localtime_r(&t, &tmv)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tmv);
+  File rf = SD.open(path, FILE_READ);
+  File wf = SD.open(tmp, FILE_WRITE);
+  if (!wf) { if (rf) rf.close(); return; }
+  if (rf) {
+    while (rf.available()) {
+      String ln = rf.readStringUntil('\n');
+      if (ln.length() == 0) continue;
+      const uint32_t e = (uint32_t)strtoul(ln.c_str(), nullptr, 10);
+      if (e != 0 && epoch > e && (epoch - e) > k_telem_keep_secs) continue;   // older than 7d
+      wf.print(ln); wf.print('\n');
+    }
+    rf.close();
+  }
+  wf.printf("%lu\t%s\t%d\t%d\t%d\n", (unsigned long)epoch, when, mv, t10, hum);
+  wf.close();
+  SD.remove(path);
+  SD.rename(tmp, path);
+}
+#endif  // HAS_TDECK_GT911
+
 static void refreshHomeBattery() {
   if (!g_lv.task) return;
   uint16_t mv = batteryMvSmoothed();
@@ -10048,6 +10573,11 @@ static lv_obj_t* s_fm_search_ta = nullptr;  // inline search field (when active)
 static lv_obj_t* s_fm_sort_lbl  = nullptr;  // sort button label (shows current mode)
 static fs::FS*   s_fm_fs        = nullptr;  // current filesystem (nullptr = roots screen)
 static char      s_fm_path[160]  = {0};     // current dir within s_fm_fs (e.g. "/" or "/foo")
+// Light the status-bar SD LED on any file-manager microSD access. The fm runs on
+// a generic fs::FS*; only &SD is real microSD I/O (Internal = SPIFFS). Browsing
+// (fmRefresh) and the file open/save paths call this; mutations re-list via
+// fmRefresh, so they blip the LED too.
+static inline void fmMarkSdIo() { if (s_fm_fs == &SD) markSdIo(); }
 static char      s_fm_store[12]  = {0};     // storage label ("Internal" / "SD")
 static char      s_fm_filter[40] = {0};     // active search filter (empty = none)
 static uint8_t   s_fm_sort       = 0;       // 0 Name A-Z, 1 Z-A, 2 Size, 3 Type
@@ -10805,6 +11335,7 @@ static bool fmSdTryMount() {
     s_sd_mounted = true;
     s_sd_size = SD.cardSize();
     s_sd_retry_after_ms = 0;                    // clear any prior backoff
+    markSdIo();                                 // mount touched the card -> blip the LED
     return true;
   }
   SD.end();                                     // clean up on failure
@@ -11123,6 +11654,7 @@ static void fmNewFileApply(const char* name) {
 // Stream a single file src -> dst (any fs to any fs). feedLoopWDT each chunk so
 // a large file can't trip the watchdog mid-copy.
 static bool fmCopyFile(fs::FS* sf, const char* sp, fs::FS* df, const char* dp) {
+  if (sf == &SD || df == &SD) markSdIo();   // copy touching the SD card -> activity LED
   File in = sf->open(sp, "r");
   if (!in) return false;
   File out = df->open(dp, "w");
@@ -11352,6 +11884,7 @@ static void fmEditorSaveCb(lv_event_t* e) {
   if (!s_editor_ta || !s_fm_fs) { fmEditorClose(); return; }
   const char* txt = lv_textarea_get_text(s_editor_ta);
   size_t len = txt ? strlen(txt) : 0;
+  fmMarkSdIo();                              // SD file save -> activity LED
   File f = s_fm_fs->open(s_editor_path, "w");
   bool ok = false;
   if (f) { ok = (f.write((const uint8_t*)txt, len) == len); f.close(); }
@@ -11439,7 +11972,8 @@ static bool fmIsImage(const char* name) {
   const char* dot = strrchr(name, '.');
   if (!dot) return false;
   return !strcasecmp(dot, ".png")  || !strcasecmp(dot, ".jpg") ||
-         !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".sjpg");
+         !strcasecmp(dot, ".jpeg") || !strcasecmp(dot, ".sjpg") ||
+         !strcasecmp(dot, ".bmp");
 }
 
 // Defined further down (with the map tile code); used here by the image viewer.
@@ -11449,11 +11983,54 @@ static uint8_t* decodeJpegToRgb565(const uint8_t* jpeg, size_t jpeg_len,
 // decode — into a small buffer — instead of being rejected. FM viewer + wallpaper.
 static uint8_t* decodeJpegScaledToRgb565(const uint8_t* jpeg, size_t jpeg_len,
                                          int* out_w, int* out_h, int max_dim);
+static uint8_t* decodePngToRgb565(const uint8_t* png, size_t png_len,
+                                  int* out_w, int* out_h);
+
+// Minimal BMP -> RGB565 decoder for the image viewer. Handles the common
+// uncompressed layouts: 16-bpp 565 (what our screenshots write) and 24-bpp BGR,
+// both bottom-up and top-down. Returns an lvglPsramAlloc'd buffer (freed via
+// lvglPsramFree), or nullptr on anything unsupported.
+static uint8_t* decodeBmpToRgb565(const uint8_t* bmp, size_t len, int* out_w, int* out_h) {
+  if (len < 54 || bmp[0] != 'B' || bmp[1] != 'M') return nullptr;
+  auto rd32 = [&](size_t o) -> uint32_t {
+    return (uint32_t)bmp[o] | ((uint32_t)bmp[o+1] << 8) | ((uint32_t)bmp[o+2] << 16) | ((uint32_t)bmp[o+3] << 24);
+  };
+  auto rd16 = [&](size_t o) -> uint16_t { return (uint16_t)(bmp[o] | (bmp[o+1] << 8)); };
+  const uint32_t data_off = rd32(10);
+  const int32_t  w        = (int32_t)rd32(18);
+  const int32_t  h_raw    = (int32_t)rd32(22);
+  const uint16_t bpp      = rd16(28);
+  const uint32_t comp     = rd32(30);
+  if (w <= 0 || w > 1024) return nullptr;
+  const bool    top_down = (h_raw < 0);
+  const int32_t h        = top_down ? -h_raw : h_raw;
+  if (h <= 0 || h > 1024)        return nullptr;
+  if (bpp != 16 && bpp != 24)    return nullptr;
+  if (comp != 0 && comp != 3)    return nullptr;          // 0 BI_RGB, 3 BI_BITFIELDS
+  const uint32_t row_bytes = (((uint32_t)w * bpp + 31) / 32) * 4;
+  if ((uint64_t)data_off + (uint64_t)row_bytes * (uint32_t)h > len) return nullptr;
+  uint16_t* out = (uint16_t*)lvglPsramAlloc((size_t)w * (size_t)h * sizeof(uint16_t));
+  if (!out) return nullptr;
+  for (int32_t y = 0; y < h; ++y) {
+    const int32_t  srcrow = top_down ? y : (h - 1 - y);   // BMP rows are bottom-up by default
+    const uint8_t* row    = bmp + data_off + (size_t)srcrow * row_bytes;
+    uint16_t*      dst    = out + (size_t)y * w;
+    if (bpp == 16) {
+      memcpy(dst, row, (size_t)w * 2);                    // assume RGB565 (our screenshots)
+    } else {
+      for (int32_t x = 0; x < w; ++x)                     // 24-bpp stored BGR
+        dst[x] = lv_color_make(row[x*3+2], row[x*3+1], row[x*3+0]).full;
+    }
+  }
+  *out_w = (int)w; *out_h = (int)h;
+  return (uint8_t*)out;
+}
 
 static void fmImageClose() {
   // Sync delete (not async): the lv_img references s_fm_img_buf, so the widget
   // must be gone before we free the buffer it draws from.
   if (s_fm_img_root) { lv_obj_del(s_fm_img_root); s_fm_img_root = nullptr; }  // also deletes the children below
+  lv_img_cache_invalidate_src(&s_fm_img_dsc);   // drop the cache entry before the buffer it points at is freed
   if (s_fm_img_buf)  { lvglPsramFree(s_fm_img_buf); s_fm_img_buf = nullptr; }   // decoded RGB565 (lvglPsramAlloc)
   s_fm_img_widget = s_fm_img_hdr = s_fm_img_close = s_fm_img_full = s_fm_img_hint = nullptr;
   s_fm_img_fs = false;
@@ -11554,6 +12131,7 @@ static void fmSetWallpaperCb(lv_event_t* e) {
 
 static void fmOpenImage(const char* name) {
   if (!s_fm_fs || !name || !name[0]) return;
+  fmMarkSdIo();                          // SD file read -> activity LED
   char path[200];
   fmFullPath(name, path, sizeof path);
   strncpy(s_fm_img_path, path, sizeof s_fm_img_path - 1);
@@ -11573,27 +12151,27 @@ static void fmOpenImage(const char* name) {
   size_t rd = f.readBytes((char*)enc, sz);
   f.close();
 
-  // This board's lv_png decoder produces RGB565 noise, so PNG can't be shown.
-  // Detect the PNG signature and say so instead of rendering garbage.
-  if (rd >= 4 && enc[0] == 0x89 && enc[1] == 'P' && enc[2] == 'N' && enc[3] == 'G') {
-    free(enc);
-    if (g_lv.task) g_lv.task->showAlert(TR("PNG isn't supported here\nUse a JPEG"), 2600);
-    return;
-  }
-
-  // Decode the JPEG to a full RGB565 buffer up front. LVGL's SJPG decoder only
-  // exposes a line-by-line reader, which a scaled/zoomed lv_img draw can't use
-  // (it needs the whole image in memory) — that renders solid black. Decoding
-  // to a TRUE_COLOR buffer is the same path the map tiles use, and it scales.
+  // Decode to a full RGB565 buffer up front (LVGL's line-by-line readers can't
+  // feed a scaled/zoomed lv_img — that renders black). Route by magic bytes:
+  // PNG -> lodepng, BMP -> our reader, else JPEG (SJPG/TJpgDec). Same TRUE_COLOR
+  // path the map tiles use, so it scales.
   int dw = 0, dh = 0;
-  uint8_t* rgb = decodeJpegToRgb565(enc, rd, &dw, &dh);
-  if (!rgb) rgb = decodeJpegScaledToRgb565(enc, rd, &dw, &dh, 1024);   // bigger than 1024 px: downscale to fit
+  uint8_t* rgb;
+  s_jpgScaleErr[0] = '\0';   // only the JPEG path sets this (e.g. "progressive")
+  if (rd >= 4 && enc[0] == 0x89 && enc[1] == 'P' && enc[2] == 'N' && enc[3] == 'G') {
+    rgb = decodePngToRgb565(enc, rd, &dw, &dh);
+  } else if (rd >= 2 && enc[0] == 'B' && enc[1] == 'M') {
+    rgb = decodeBmpToRgb565(enc, rd, &dw, &dh);
+  } else {
+    rgb = decodeJpegToRgb565(enc, rd, &dw, &dh);
+    if (!rgb) rgb = decodeJpegScaledToRgb565(enc, rd, &dw, &dh, 1024);   // > 1024 px JPEG: downscale to fit
+  }
   free(enc);             // encoded bytes no longer needed once decoded
   if (!rgb || dw <= 0 || dh <= 0) {
     if (rgb) lvglPsramFree(rgb);
-    char emsg[88];
-    if (s_jpgScaleErr[0]) snprintf(emsg, sizeof emsg, "%s", s_jpgScaleErr);   // specific, actionable reason
-    else                  snprintf(emsg, sizeof emsg, "Can't display image\n(JPEG only)");
+    char emsg[96];
+    if (s_jpgScaleErr[0]) snprintf(emsg, sizeof emsg, "%s", s_jpgScaleErr);   // specific JPEG reason (e.g. progressive)
+    else                  snprintf(emsg, sizeof emsg, "Can't display image\n(JPEG/PNG/BMP, <= 1024 px)");
     if (g_lv.task) g_lv.task->showAlert(emsg, 3600);
     return;
   }
@@ -11606,6 +12184,10 @@ static void fmOpenImage(const char* name) {
   s_fm_img_dsc.header.h  = (uint32_t)dh;
   s_fm_img_dsc.data      = s_fm_img_buf;
   s_fm_img_dsc.data_size = (uint32_t)dw * (uint32_t)dh * sizeof(lv_color_t);
+  // s_fm_img_dsc is a reused static, so LVGL's image cache (keyed on the src
+  // pointer) would hand back the PREVIOUS image's decoded geometry/data — the
+  // "half old, half new" render. Drop the stale entry so this dsc decodes fresh.
+  lv_img_cache_invalidate_src(&s_fm_img_dsc);
   const int w = dw, h = dh;
 
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
@@ -11851,6 +12433,7 @@ static void fmRefresh() {
       root.close();
     }
   } else {
+    fmMarkSdIo();                                           // SD browse -> activity LED
     File dir = s_fm_fs->open(s_fm_path);                    // SD / FAT: real directory listing
     if (dir) {
       File e = dir.openNextFile();
@@ -13598,6 +14181,9 @@ static lv_obj_t* s_map_touch       = nullptr;   // transparent full-page touch c
 static lv_obj_t* s_map_info_lbl    = nullptr;   // coords read-out (bottom-left corner)
 static lv_obj_t* s_map_count_lbl   = nullptr;   // marker / download count (bottom-right corner)
 static lv_obj_t* s_map_status_lbl  = nullptr;
+static lv_obj_t* s_map_zoom_lbl    = nullptr;   // zoom + tile path at center (top-left, under © OSM)
+static lv_obj_t* s_map_zoom_slider = nullptr;   // zoom slider overlay (toggled by the zoom button)
+static lv_obj_t* s_map_zoom_val    = nullptr;   // live "z<level>" readout centred above the slider
 
 #if defined(ESP32)
 // Dedicated LittleFS instance for the map tile pack — mounts the "tiles"
@@ -13625,23 +14211,31 @@ static bool           s_tiles_fs_ready = false;
 static fs::FS*        s_tile_fs   = nullptr;
 static char           s_tile_root[16] = "";
 
+// When the tile cache is on the SD fallback (s_tile_fs != the LittleFS partition),
+// every access is real microSD I/O -> light the activity LED. On the flash
+// partition this is a no-op (the LED tracks SD only).
+static inline void tileCacheMarkSdIo() { if (s_tile_fs && s_tile_fs != &s_tiles_fs) markSdIo(); }
 static inline bool tileCacheExists(const char* rel) {
   if (!s_tile_fs) return false;
+  tileCacheMarkSdIo();
   char p[80]; snprintf(p, sizeof p, "%s%s", s_tile_root, rel);
   return s_tile_fs->exists(p);
 }
 static inline File tileCacheOpen(const char* rel, const char* mode) {
   if (!s_tile_fs) return File();
+  tileCacheMarkSdIo();
   char p[80]; snprintf(p, sizeof p, "%s%s", s_tile_root, rel);
   return s_tile_fs->open(p, mode);
 }
 static inline void tileCacheRemove(const char* rel) {
   if (!s_tile_fs) return;
+  tileCacheMarkSdIo();
   char p[80]; snprintf(p, sizeof p, "%s%s", s_tile_root, rel);
   s_tile_fs->remove(p);
 }
 static inline void tileCacheMkdir(const char* rel) {
   if (!s_tile_fs) return;
+  tileCacheMarkSdIo();
   char p[80]; snprintf(p, sizeof p, "%s%s", s_tile_root, rel);
   s_tile_fs->mkdir(p);
 }
@@ -14592,6 +15186,7 @@ static bool loadTileJpeg(uint8_t z, int32_t x, int32_t y,
   if (s_tiles_from_sd) {
     // Tile source = microSD: read straight off the card (fully offline, no server fetch).
     if (!fmSdTryMount()) return false;
+    markSdIo();                          // SD read activity -> status-bar LED
     // Prefer the Meshtastic/MeshCore standard layout /maps/osm/{z}/{x}/{y}.png
     // (decoded via lodepng); fall back to the legacy /tiles/{z}/{x}/{y}.jpg.
     char ppath[56];
@@ -14834,6 +15429,13 @@ static void renderMapTiles() {
                      : decodeJpegToRgb565(jpeg, jlen, &dw, &dh);
     lvglPsramFree(jpeg);
     if (!rgb) { ++n_missing; continue; }
+    // Night mode: invert the decoded RGB565 in place (render-only — the on-disk
+    // tile is untouched). ~p flips all three channels; light maps go dark.
+    if (s_map_night) {
+      uint16_t* px = (uint16_t*)rgb;
+      const int cnt = dw * dh;
+      for (int p = 0; p < cnt; ++p) px[p] = (uint16_t)~px[p];
+    }
     dst->z = s_map_zoom; dst->x = wanted[i].tx; dst->y = wanted[i].ty;
     dst->rgb565 = rgb;
     dst->w = dw; dst->h = dh;
@@ -15502,6 +16104,20 @@ static void mapOptLinesCb(lv_event_t* e) {
   renderMapMarkers();   // rebuild links to reflect the new state
 }
 
+// "Night mode" switch — invert tile colours at render time. Re-decodes the
+// visible tiles so the change is immediate, and persists the choice.
+static void mapOptNightCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  s_map_night = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetMapNight(s_map_night);
+#endif
+  freeMapTiles();        // drop cached decodes so they re-decode with the new mode
+  renderMapTiles();
+  renderMapMarkers();
+  applyMapChrome(true);  // re-tint the status bar + tab bar for the new tile brightness
+}
+
 #if defined(HAS_TDECK_GT911)
 // Map tile source toggle (in the map options popup): ON = read tiles off the microSD
 // (fully offline, no server fetch); OFF = tile server + on-device cache.
@@ -15646,13 +16262,14 @@ static void openMapOptions() {
   const lv_coord_t cardw = sw - 24;
   lv_obj_t* card = lv_obj_create(s_map_opts_root);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, cardw, 210);   // tall enough for the (T-Deck) SD-tiles row + About
+  lv_obj_set_size(card, cardw, LV_SIZE_CONTENT);                       // grow to the rows...
+  lv_obj_set_style_max_height(card, sh - STATUSBAR_H - 16, LV_PART_MAIN);  // ...scroll if past the screen
   lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 8);
   styleSurface(card, COLOR_PANEL, 8);
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
 
   lv_obj_t* title = lv_label_create(card);
   lv_label_set_text(title, TR("Map options"));
@@ -15672,6 +16289,20 @@ static void openMapOptions() {
   if (s_map_show_links) lv_obj_add_state(sw_lines, LV_STATE_CHECKED);
   lv_obj_add_event_cb(sw_lines, mapOptLinesCb, LV_EVENT_VALUE_CHANGED, nullptr);
   y += 40;
+
+  // Row: Night mode (invert tile colours).
+  {
+    lv_obj_t* nl = lv_label_create(card);
+    lv_label_set_text(nl, TR("Night mode (invert)"));
+    lv_obj_set_style_text_color(nl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_pos(nl, 2, y + 4);
+    lv_obj_t* sw_night = lv_switch_create(card);
+    lv_obj_align(sw_night, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (s_map_night) lv_obj_add_state(sw_night, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw_night, mapOptNightCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += 40;
+  }
 
 #if defined(HAS_TDECK_GT911)
   // Row: tile source — microSD (offline) vs the tile server.
@@ -15893,6 +16524,26 @@ static void mapContactsRowCb(lv_event_t* e) {
     snprintf(msg, sizeof(msg), TR("Centered on %s"), nm[0] ? nm : "contact");
     g_lv.task->showAlert(msg, 1200);
   }
+}
+
+// "Show on map" from the contact action sheet: centre the map on the contact's
+// last-known GPS and switch to the Map tab. Defined here (not with the sheet)
+// because it touches the map statics declared in this region.
+static void actionSheetShowOnMapCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  ContactInfo c;
+  const bool ok = the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c);
+  closeActionSheet();
+  if (!ok) { if (g_lv.task) g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
+  if (c.gps_lat == 0 && c.gps_lon == 0) {
+    if (g_lv.task) g_lv.task->showAlert(TR("No location for this contact"), 1500);
+    return;
+  }
+  s_map_center_lat = (double)c.gps_lat / 1.0e6;
+  s_map_center_lon = (double)c.gps_lon / 1.0e6;
+  s_map_view_inited = true;   // keep this centre — don't recentre on self on open
+  if (s_map_zoom < k_map_zoom_max) s_map_zoom = (uint8_t)(s_map_zoom + 1);
+  goToTab(MAP_TAB_INDEX);      // onMapTabActivated renders tiles + markers + overlay
 }
 
 // One GPS-bearing contact, with the derived sort keys precomputed.
@@ -16267,6 +16918,44 @@ static void mapZoomOutCb(lv_event_t* e) {
   renderMapMarkers();
   refreshMapInfoLabel();
 }
+// Zoom slider overlay. The zoom button toggles it; dragging updates the live
+// readout, and releasing applies + persists the chosen level.
+static void mapZoomSliderCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const int z = (int)lv_slider_get_value(lv_event_get_target(e));
+  if (s_map_zoom_val) lv_label_set_text_fmt(s_map_zoom_val, "zoom %d", z);   // live target level while dragging
+}
+static void mapZoomSliderReleaseCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_RELEASED) return;
+  int z = (int)lv_slider_get_value(lv_event_get_target(e));
+  if (z < (int)k_map_zoom_min) z = k_map_zoom_min;
+  if (z > (int)k_map_zoom_max) z = k_map_zoom_max;
+  if ((uint8_t)z == s_map_zoom) return;
+  s_map_zoom = (uint8_t)z;
+#if defined(ESP32)
+  touchPrefsSetMapZoom(s_map_zoom);   // persist the user's choice across reboots
+#endif
+  renderMapTiles();
+  renderMapMarkers();
+  refreshMapInfoLabel();
+}
+static void mapZoomToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (!s_map_zoom_slider) return;
+  if (lv_obj_has_flag(s_map_zoom_slider, LV_OBJ_FLAG_HIDDEN)) {
+    lv_slider_set_value(s_map_zoom_slider, s_map_zoom, LV_ANIM_OFF);
+    lv_obj_clear_flag(s_map_zoom_slider, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_map_zoom_slider);
+    if (s_map_zoom_val) {
+      lv_label_set_text_fmt(s_map_zoom_val, "zoom %d", (int)s_map_zoom);
+      lv_obj_clear_flag(s_map_zoom_val, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(s_map_zoom_val);
+    }
+  } else {
+    lv_obj_add_flag(s_map_zoom_slider, LV_OBJ_FLAG_HIDDEN);
+    if (s_map_zoom_val) lv_obj_add_flag(s_map_zoom_val, LV_OBJ_FLAG_HIDDEN);
+  }
+}
 static void mapRecenterCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (!g_lv.task) return;
@@ -16308,8 +16997,13 @@ static void onMapTabActivated() {
     // around this center. After this, the user's zoom-in/out taps are honoured
     // verbatim — they can pop above the pack and see "no tile pack" (a clear
     // cue to tap − to go back).
+    // A user-saved zoom (persisted across reboots) wins over the auto-snap.
+    bool have_saved_zoom = false;
+#if defined(ESP32)
+    have_saved_zoom = (touchPrefsGetMapZoom() != 0);
+#endif
     const uint8_t best = bestAvailableZoom(s_map_center_lat, s_map_center_lon);
-    if (best != 0) s_map_zoom = best;
+    if (best != 0 && !have_saved_zoom) s_map_zoom = best;
     if (!(s_map_center_lat == 0.0 && s_map_center_lon == 0.0)) s_map_view_inited = true;
   }
   // 9 SPIFFS reads + JPEG decodes take ~1-3 seconds on first paint. Show a
@@ -16349,8 +17043,11 @@ static void applyMapChrome(bool on) {
   if (g_statusbar.root) {
     lv_obj_set_style_bg_opa(g_statusbar.root, on ? LV_OPA_TRANSP : LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_opa(g_statusbar.root, on ? LV_OPA_TRANSP : LV_OPA_30, LV_PART_MAIN);
-    const lv_color_t fg     = lv_color_hex(on ? 0x000000 : COLOR_TEXT);
-    const lv_color_t fg_sub = lv_color_hex(on ? 0x000000 : COLOR_SUB);
+    // Night mode inverts the tiles to DARK, so the on-map chrome flips from black
+    // (legible over light tiles) to off-white (legible over the dark inverted tiles).
+    const bool night = on && s_map_night;
+    const lv_color_t fg     = lv_color_hex(!on ? COLOR_TEXT : (night ? 0xF0F0F0 : 0x000000));
+    const lv_color_t fg_sub = lv_color_hex(!on ? COLOR_SUB  : (night ? 0xC8CCD0 : 0x000000));
     if (g_statusbar.left_label) lv_obj_set_style_text_color(g_statusbar.left_label, fg, LV_PART_MAIN);
     if (g_statusbar.batt_icon)  lv_obj_set_style_text_color(g_statusbar.batt_icon, fg, LV_PART_MAIN);
     if (g_statusbar.batt_pct)   lv_obj_set_style_text_color(g_statusbar.batt_pct, fg_sub, LV_PART_MAIN);
@@ -16365,11 +17062,13 @@ static void applyMapChrome(bool on) {
       // Fully transparent on the map — the black icons read directly over the
       // map tiles, no grey bar behind them.
       lv_obj_set_style_bg_opa(btns, on ? LV_OPA_TRANSP : LV_OPA_COVER, LV_PART_MAIN);
-      lv_obj_set_style_text_color(btns, lv_color_hex(on ? 0x101010 : COLOR_SUB), LV_PART_ITEMS);
-      // Off-map: active icon back to the ACCENT colour (not white). On-map: black
-      // icon for contrast over the tiles. (The accent indicator bar is hidden on
-      // the map separately by updateTabIndicator().)
-      lv_obj_set_style_text_color(btns, lv_color_hex(on ? 0x000000 : COLOR_ACCENT),
+      // Day map: black icons over light tiles. Night map: off-white over dark tiles.
+      const bool night_tabs = on && s_map_night;
+      lv_obj_set_style_text_color(btns, lv_color_hex(!on ? COLOR_SUB : (night_tabs ? 0xE6EAEE : 0x101010)), LV_PART_ITEMS);
+      // Off-map: active icon back to the ACCENT colour (not white). On-map: high-
+      // contrast icon for the tile brightness. (The accent indicator bar is hidden
+      // on the map separately by updateTabIndicator().)
+      lv_obj_set_style_text_color(btns, lv_color_hex(!on ? COLOR_ACCENT : (night_tabs ? 0xFFFFFF : 0x000000)),
                                   LV_PART_ITEMS | LV_STATE_CHECKED);
     }
   }
@@ -16451,6 +17150,12 @@ static void makeMapTab(lv_obj_t* tab) {
   style_corner(s_map_count_lbl);
   lv_label_set_text(s_map_count_lbl, TR(""));
   lv_obj_align(s_map_count_lbl, LV_ALIGN_BOTTOM_RIGHT, -2, -2);
+  // Zoom + tile path at the current center — a second line just under the
+  // "© OpenStreetMap" status-bar attribution (top-left).
+  s_map_zoom_lbl = lv_label_create(tab);
+  style_corner(s_map_zoom_lbl);
+  lv_label_set_text(s_map_zoom_lbl, TR(""));
+  lv_obj_align(s_map_zoom_lbl, LV_ALIGN_TOP_LEFT, 2, STATUSBAR_H + 2);
   (void)kMapInfoH;
 
   // Touch catcher: the tiles live on the background canvas (behind the tabview)
@@ -16493,10 +17198,38 @@ static void makeMapTab(lv_obj_t* tab) {
   // Options gear sits at the TOP of the right-edge column; zoom/recenter below,
   // then a "contacts on map" picker (list of GPS-bearing contacts → recenter).
   make_overlay_btn(LV_SYMBOL_SETTINGS, 4,         mapOpenOptionsCb);
-  make_overlay_btn(LV_SYMBOL_PLUS,     4 + 32,    mapZoomInCb);
-  make_overlay_btn(LV_SYMBOL_MINUS,    4 + 32*2,  mapZoomOutCb);
-  make_overlay_btn(LV_SYMBOL_GPS,      4 + 32*3,  mapRecenterCb);
-  make_overlay_btn(LV_SYMBOL_LIST,     4 + 32*4,  mapOpenContactsCb);
+  make_overlay_btn(TOUCH_SYM_ZOOM,     4 + 32,    mapZoomToggleCb);   // magnifier — toggles the zoom slider (was +/-)
+  make_overlay_btn(LV_SYMBOL_GPS,      4 + 32*2,  mapRecenterCb);
+  make_overlay_btn(LV_SYMBOL_LIST,     4 + 32*3,  mapOpenContactsCb);
+
+  // Zoom slider — a full-width overlay along the bottom of the map, hidden until
+  // the zoom button is tapped. Reuses the control-centre brightness-slider look.
+  s_map_zoom_slider = lv_slider_create(tab);
+  lv_obj_set_size(s_map_zoom_slider, k_map_canvas_w - 24, 8);
+  lv_obj_align(s_map_zoom_slider, LV_ALIGN_BOTTOM_MID, 0, -(TABBAR_H + 8));
+  lv_slider_set_range(s_map_zoom_slider, k_map_zoom_min, k_map_zoom_max);
+  lv_slider_set_value(s_map_zoom_slider, s_map_zoom, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(s_map_zoom_slider, lv_color_hex(0x202428), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_map_zoom_slider, LV_OPA_80, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_map_zoom_slider, lv_color_hex(COLOR_ACCENT), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(s_map_zoom_slider, lv_color_hex(COLOR_ACCENT), LV_PART_KNOB);
+  lv_obj_set_style_pad_all(s_map_zoom_slider, 6, LV_PART_KNOB);
+  lv_obj_add_event_cb(s_map_zoom_slider, mapZoomSliderCb,        LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(s_map_zoom_slider, mapZoomSliderReleaseCb, LV_EVENT_RELEASED,      nullptr);
+  lv_obj_add_flag(s_map_zoom_slider, LV_OBJ_FLAG_HIDDEN);
+
+  // Live zoom-level readout, centred above the whole slider; shown with it.
+  s_map_zoom_val = lv_label_create(tab);
+  lv_label_set_text(s_map_zoom_val, "zoom");
+  lv_obj_set_style_text_font(s_map_zoom_val, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_map_zoom_val, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(s_map_zoom_val, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_map_zoom_val, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_set_style_pad_hor(s_map_zoom_val, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_ver(s_map_zoom_val, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_map_zoom_val, 4, LV_PART_MAIN);
+  lv_obj_align_to(s_map_zoom_val, s_map_zoom_slider, LV_ALIGN_OUT_TOP_MID, 0, -6);
+  lv_obj_add_flag(s_map_zoom_val, LV_OBJ_FLAG_HIDDEN);
 
   // (OSM attribution now lives in the status bar's left zone on the map tab —
   // see updateGlobalStatusBar.)
@@ -16541,6 +17274,24 @@ static void refreshMapInfoLabel() {
   else                          snprintf(buf, sizeof(buf), "%.4f, %.4f", lat, lon);
   lv_label_set_text(s_map_info_lbl, buf);
   if (s_map_count_lbl) lv_label_set_text(s_map_count_lbl, tail);
+
+  // Zoom + tile path (z / x / y) at the current map center — the "second line"
+  // under the © OpenStreetMap attribution. Uses the map center (post-pan), not
+  // the self GPS fix.
+  if (s_map_zoom_lbl) {
+    if (s_map_center_lat == 0.0 && s_map_center_lon == 0.0) {
+      lv_label_set_text(s_map_zoom_lbl, "");
+    } else {
+      double cwx, cwy;
+      latLonToWorldPx(s_map_center_lat, s_map_center_lon, s_map_zoom, &cwx, &cwy);
+      const long tx = (long)floor(cwx / 256.0);
+      const long ty = (long)floor(cwy / 256.0);
+      char zbuf[40];
+      snprintf(zbuf, sizeof zbuf, "z%u  %u/%ld/%ld",
+               (unsigned)s_map_zoom, (unsigned)s_map_zoom, tx, ty);
+      lv_label_set_text(s_map_zoom_lbl, zbuf);
+    }
+  }
 }
 
 // ---- Discord-style unread divider + jump-to-latest (state declared earlier;
@@ -17924,6 +18675,13 @@ static void refreshChatDetail(LvChatPanel& p) {
     if (m.outgoing && m.sent_fp) {
       const uint8_t reps = the_mesh.uiRepeatsForFp(m.sent_fp);
       if (reps > 0) snprintf(rep_buf, sizeof(rep_buf), " " LV_SYMBOL_REFRESH "%u", (unsigned)reps);
+    } else if (!m.outgoing && (m.meta_flags & UITask::MSG_META_HAS_RX)
+                           && (m.meta_flags & UITask::MSG_META_IS_FLOOD)) {
+      // Incoming flood: show how many repeater hops it traversed, in the same
+      // spot the outgoing repeats count uses. Hop count is the low 6 bits of
+      // path_len (same field the message-info popup reads). 0 = heard direct.
+      const uint8_t hops = (uint8_t)(m.path_len & 0x3F);
+      snprintf(rep_buf, sizeof(rep_buf), " " LV_SYMBOL_SHUFFLE "%u", (unsigned)hops);
     }
     if (ts_buf[0] || deliv_glyph[0] || rep_buf[0]) {
       char footer[40];
@@ -18263,6 +19021,9 @@ static void formatDistanceBadge(char* out, size_t out_cap,
   }
 }
 
+// Clock snapshot for the contacts sort's "?" test — set before qsort so the
+// non-capturing comparator can read it (mirrors formatAgeBadge's condition).
+static uint32_t s_ct_sort_now = 0;
 static void refreshContactsList() {
   if (!g_lv.contacts_list || !g_lv.task) return;
   if (s_ctd_active) return;   // mid bulk-delete: don't rebuild rows under the progress modal
@@ -18387,6 +19148,9 @@ static void refreshContactsList() {
     e.name[sizeof(e.name) - 1] = '\0';
   }
 
+  // Capture the clock before sorting (the qsort comparator is non-capturing).
+  { mesh::RTCClock* rtc = the_mesh.getRTCClock(); s_ct_sort_now = rtc ? rtc->getCurrentTime() : 0; }
+
   qsort(s_entries, n_entries, sizeof(Entry),
         [](const void* a, const void* b) -> int {
     const Entry* ea = static_cast<const Entry*>(a);
@@ -18397,6 +19161,17 @@ static void refreshContactsList() {
     if (ea->is_fav != eb->is_fav) {
       return ea->is_fav ? -1 : 1;
     }
+    // Contacts whose last-heard renders as "?" sink to the end in every sort
+    // mode. "?" is NOT just last_heard==0: formatAgeBadge also shows it for a
+    // future/garbage timestamp (RTC unset -> now <= last_heard) or one over
+    // 400 days old. Mirror that exact condition using the captured clock so
+    // the sort matches what the row actually displays.
+    const uint32_t now = s_ct_sort_now;
+    const uint32_t a_age = (now > ea->last_heard && ea->last_heard != 0) ? (now - ea->last_heard) : 0;
+    const uint32_t b_age = (now > eb->last_heard && eb->last_heard != 0) ? (now - eb->last_heard) : 0;
+    const bool a_unknown = (a_age == 0 || a_age > (uint32_t)400 * 24u * 3600u);
+    const bool b_unknown = (b_age == 0 || b_age > (uint32_t)400 * 24u * 3600u);
+    if (a_unknown != b_unknown) return a_unknown ? 1 : -1;
     if (g_contacts_sort == CONTACTS_SORT_LAST_HEARD ||
         g_contacts_sort == CONTACTS_SORT_LAST_MSG) {
       if (eb->last_heard != ea->last_heard) {
@@ -18672,6 +19447,16 @@ static void updateTrackball(unsigned long now) {
   int dx = 0, dy = 0;
   const bool moved = tdeckTrackballReadMotion(&dx, &dy);
   if (s_tb_reverse) { dx = -dx; dy = -dy; }   // user opted to invert scrollball direction
+
+  // ---- Snake game ----
+  // While Snake is open the trackball steers it (no soft cursor on that page).
+  if (SnakeGame::isOpen()) {
+    if (!lv_obj_has_flag(s_tb_cursor, LV_OBJ_FLAG_HIDDEN))
+      lv_obj_add_flag(s_tb_cursor, LV_OBJ_FLAG_HIDDEN);
+    s_tb_click_press = false;
+    if (moved && (dx != 0 || dy != 0)) { SnakeGame::steer(dx, dy); if (g_lv.task) g_lv.task->noteUserInput(); }
+    return;
+  }
 
   // ---- Emoji picker selector mode ----
   // While the emoji sheet is open the trackball drives a grid highlight instead
@@ -20765,7 +21550,7 @@ static void openControlCenter() {
 enum AppDrawerAction {
   APPACT_CHATS, APPACT_CONTACTS, APPACT_MAP, APPACT_SETTINGS,
   APPACT_ADVERT, APPACT_POWER, APPACT_MENTIONS, APPACT_CMDCENTER, APPACT_SIGNAL,
-  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR,
+  APPACT_TERMINAL, APPACT_FILES, APPACT_MONITOR, APPACT_SNAKE,
 };
 
 static void closeAppDrawer() {
@@ -20994,6 +21779,7 @@ static void appTileCb(lv_event_t* e) {
     case APPACT_MONITOR:   openMonitorPage();    return;   // RF activity graph + repeater-style radio stats
     case APPACT_ADVERT:    openAdvertModalCb(e);  return;
     case APPACT_POWER:     openPowerMenu();      return;
+    case APPACT_SNAKE:     SnakeGame::launch();  return;
 #if defined(HAS_TDECK_GT911)
     case APPACT_TERMINAL:  homeTerminalCb(e);    return;
     case APPACT_FILES:     homeFilesCb(e);       return;
@@ -21118,6 +21904,8 @@ static void openAppDrawer() {
   lv_obj_set_style_bg_color(s_appdrawer_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_appdrawer_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_scroll_dir(s_appdrawer_root, LV_DIR_VER);   // grid scrolls top->bottom when it overflows
+  lv_obj_set_scrollbar_mode(s_appdrawer_root, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_pad_bottom(s_appdrawer_root, 10, LV_PART_MAIN);   // room past the last row when scrolled
   lv_obj_move_foreground(s_appdrawer_root);
 
   // First tile is "Command" (back to the command centre); the rest are the apps.
@@ -21139,14 +21927,15 @@ static void openAppDrawer() {
     { ">_",                "Terminal",  APPACT_TERMINAL, 0,         0x3DD27A },      // console green
     { LV_SYMBOL_DIRECTORY, "Files",     APPACT_FILES,    0,         0xE6BE4A },      // folder gold
 #endif
+    { "\xF0\x9F\x90\x8D",  "Snake",     APPACT_SNAKE,    0,         0x53C06B },      // snake game
     { LV_SYMBOL_POWER,     "Power",     APPACT_POWER,    0,         0xE05544 },      // power red
   };
   const int n = (int)(sizeof(tiles) / sizeof(tiles[0]));
 
-  // Column count: 4 on the T-Deck (11 tiles incl. Terminal/Files), 3 on the V4
-  // (9 tiles -> a clean 3x3 grid instead of a sparse 4+4+1). Tile height shrinks
-  // so ALL rows fit the screen with no scrolling, capped so tiles don't balloon.
-  // Scroll stays enabled only as a safety net if a row still overflows.
+  // Column count: 4 on the T-Deck, 3 on the V4 (a cleaner grid for the smaller
+  // tile set). Tile height is sized to fit the rows on screen but CLAMPED to a
+  // comfortable [60, 84] px band — so a full app list overflows into the vertical
+  // scroll region rather than shrinking the tiles to tiny squares.
 #if defined(HAS_TDECK_GT911)
   const int cols = 4;
 #else
@@ -21159,6 +21948,7 @@ static void openAppDrawer() {
   const int avail  = (sh - STATUSBAR_H - TABBAR_H) - top - 8;   // content area minus top inset + bottom margin
   int tile_h = (avail - (rows - 1) * gap) / rows;
   if (tile_h > 84) tile_h = 84;
+  if (tile_h < 60) tile_h = 60;   // floor: overflow scrolls instead of shrinking to tiny tiles
   for (int i = 0; i < n; i++) {
     const int col = i % cols, row = i / cols;
     addAppTile(s_appdrawer_root, pad + col * (tile_w + gap), top + row * (tile_h + gap),
@@ -21167,8 +21957,28 @@ static void openAppDrawer() {
   }
 }
 
+// Status-bar long-hold (3 s) -> full-screen screenshot to /screenshots on SD.
+static uint32_t s_sb_press_ms  = 0;
+static bool     s_sb_shot_done = false;
+static void takeScreenshotToSd();   // fwd
+static void statusBarHoldCb(lv_event_t* e) {
+  switch (lv_event_get_code(e)) {
+    case LV_EVENT_PRESSED:   s_sb_press_ms = millis(); s_sb_shot_done = false; break;
+    case LV_EVENT_PRESSING:
+      if (!s_sb_shot_done && s_sb_press_ms && (uint32_t)(millis() - s_sb_press_ms) >= 3000) {
+        s_sb_shot_done = true;          // suppress the release CLICK (no control center)
+        takeScreenshotToSd();
+      }
+      break;
+    case LV_EVENT_RELEASED:
+    case LV_EVENT_PRESS_LOST: s_sb_press_ms = 0; break;
+    default: break;
+  }
+}
+
 static void statusBarTapCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (s_sb_shot_done) { s_sb_shot_done = false; return; }   // this press was a screenshot hold
   // While a settings detail sheet is open the bar shows its Back chevron + title,
   // so a tap means "go back" rather than opening the control center.
   if (s_settings_sheet) {
@@ -21178,6 +21988,77 @@ static void statusBarTapCb(lv_event_t* e) {
     return;
   }
   if (s_cc_root) closeControlCenter(); else openControlCenter();
+}
+
+// Capture the composited screen to a 16-bit BMP on the SD card. BMP (no
+// compression) is the quickest viewable format to emit — rows are a direct copy
+// of the RGB565 framebuffer (LV_COLOR_16_SWAP is 0). Saved to /screenshots.
+static void takeScreenshotToSd() {
+#if defined(HAS_TDECK_GT911)
+  auto toast = [&](const char* m){ if (g_lv.task) g_lv.task->showAlert(m, 1800); };
+  if (SD.cardType() == CARD_NONE) { toast(TR("Screenshot: no SD card")); return; }
+  const int W = lv_disp_get_hor_res(nullptr);
+  const int H = lv_disp_get_ver_res(nullptr);
+  lv_color_t* buf = (lv_color_t*)heap_caps_malloc((size_t)W * H * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+  if (!buf) buf = (lv_color_t*)malloc((size_t)W * H * sizeof(lv_color_t));
+  if (!buf) { toast(TR("Screenshot: low memory")); return; }
+
+  // Mirror a forced full-screen redraw (all layers) into buf via the flush hook.
+  g_shot_w = W; g_shot_h = H; g_shot_buf = buf;
+  lv_obj_invalidate(lv_scr_act());
+  lv_obj_invalidate(lv_layer_top());
+  lv_obj_invalidate(lv_layer_sys());
+  lv_refr_now(NULL);
+  g_shot_buf = nullptr;
+
+  markSdIo();
+  SD.mkdir("/screenshots");
+  char path[48];
+  const time_t now = time(nullptr);
+  if (now > 1700000000) {
+    struct tm tmv; localtime_r(&now, &tmv);
+    strftime(path, sizeof path, "/screenshots/%Y%m%d_%H%M%S.bmp", &tmv);
+  } else {
+    snprintf(path, sizeof path, "/screenshots/up_%lu.bmp", (unsigned long)millis());
+  }
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) { free(buf); toast(TR("Screenshot: write failed")); return; }
+
+  const uint32_t row_bytes = (uint32_t)(((W * 16 + 31) / 32) * 4);   // 4-byte aligned
+  const uint32_t img_bytes = row_bytes * (uint32_t)H;
+  const uint32_t data_off  = 14u + 40u + 12u;                        // headers + RGB565 bit masks
+  uint8_t hdr[66];
+  memset(hdr, 0, sizeof hdr);
+  auto put16 = [&](int o, uint16_t v){ hdr[o] = v & 0xFF; hdr[o+1] = v >> 8; };
+  auto put32 = [&](int o, uint32_t v){ hdr[o]=v&0xFF; hdr[o+1]=(v>>8)&0xFF; hdr[o+2]=(v>>16)&0xFF; hdr[o+3]=(v>>24)&0xFF; };
+  hdr[0] = 'B'; hdr[1] = 'M';
+  put32(2, data_off + img_bytes);   // file size
+  put32(10, data_off);              // pixel data offset
+  put32(14, 40);                    // DIB header size
+  put32(18, (uint32_t)W);
+  put32(22, (uint32_t)H);           // positive = bottom-up
+  put16(26, 1);                     // planes
+  put16(28, 16);                    // bpp
+  put32(30, 3);                     // BI_BITFIELDS
+  put32(34, img_bytes);
+  put32(38, 2835); put32(42, 2835); // ~72 DPI
+  put32(54, 0x0000F800);            // red mask
+  put32(58, 0x000007E0);            // green mask
+  put32(62, 0x0000001F);            // blue mask
+  f.write(hdr, sizeof hdr);
+
+  static const uint8_t pad[4] = {0,0,0,0};
+  const uint32_t pad_n = row_bytes - (uint32_t)W * 2u;
+  for (int y = H - 1; y >= 0; --y) {                 // BMP rows are bottom-up
+    f.write((uint8_t*)(buf + (size_t)y * W), (size_t)W * 2u);
+    if (pad_n) f.write(pad, pad_n);
+  }
+  f.close();
+  free(buf);
+  toast(path);
+#else
+  if (g_lv.task) g_lv.task->showAlert(TR("Screenshot needs an SD card"), 1800);
+#endif
 }
 
 // Build the always-on status bar. Called once from UITask::begin after
@@ -21196,6 +22077,11 @@ static void buildGlobalStatusBar() {
   // clock/battery). Child labels are non-clickable, so taps reach the root.
   lv_obj_add_flag(g_statusbar.root, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(g_statusbar.root, statusBarTapCb, LV_EVENT_CLICKED, nullptr);
+  // Hold the bar for 3 s to drop a screenshot to the SD card.
+  lv_obj_add_event_cb(g_statusbar.root, statusBarHoldCb, LV_EVENT_PRESSED,    nullptr);
+  lv_obj_add_event_cb(g_statusbar.root, statusBarHoldCb, LV_EVENT_PRESSING,   nullptr);
+  lv_obj_add_event_cb(g_statusbar.root, statusBarHoldCb, LV_EVENT_RELEASED,   nullptr);
+  lv_obj_add_event_cb(g_statusbar.root, statusBarHoldCb, LV_EVENT_PRESS_LOST, nullptr);
   lv_obj_set_style_border_side(g_statusbar.root, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
   lv_obj_set_style_border_color(g_statusbar.root, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
   lv_obj_set_style_border_opa(g_statusbar.root, LV_OPA_30, LV_PART_MAIN);
@@ -21237,11 +22123,22 @@ static void buildGlobalStatusBar() {
   lv_obj_set_style_text_font(g_statusbar.batt_pct, &g_font_12, LV_PART_MAIN);
   lv_obj_align(g_statusbar.batt_pct, LV_ALIGN_RIGHT_MID, -22, 0);
 
+  // Tapping the battery (icon or %) opens the 24h battery-history chart (logged to
+  // SD on T-Deck, else internal SPIFFS — works on both builds). Generous ext-click
+  // area so the small glyphs are easy to hit; the rest of the bar still routes to
+  // statusBarTapCb (control center).
+  lv_obj_add_flag(g_statusbar.batt_icon, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(g_statusbar.batt_icon, 10);
+  lv_obj_add_event_cb(g_statusbar.batt_icon, batteryTapCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_flag(g_statusbar.batt_pct, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(g_statusbar.batt_pct, 10);
+  lv_obj_add_event_cb(g_statusbar.batt_pct, batteryTapCb, LV_EVENT_CLICKED, nullptr);
+
   g_statusbar.clock = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.clock, TR("--:--"));
   lv_obj_set_style_text_color(g_statusbar.clock, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.clock, &g_font_12, LV_PART_MAIN);
-  lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, -110, 0);
+  lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, -126, 0);   // shifted left to free a slot for the SD LED
 
   // Wi-Fi glyph (right of the Bluetooth glyph, left of the signal bars).
   g_statusbar.conn_icon = lv_label_create(g_statusbar.root);
@@ -21250,12 +22147,36 @@ static void buildGlobalStatusBar() {
   lv_obj_set_style_text_font(g_statusbar.conn_icon, &g_font_12, LV_PART_MAIN);
   lv_obj_align(g_statusbar.conn_icon, LV_ALIGN_RIGHT_MID, -73, 0);
 
-  // Bluetooth glyph (left of Wi-Fi).
+  // Bluetooth glyph (left of the SD LED).
   g_statusbar.ble_icon = lv_label_create(g_statusbar.root);
   lv_label_set_text(g_statusbar.ble_icon, TR(""));
   lv_obj_set_style_text_color(g_statusbar.ble_icon, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.ble_icon, &g_font_12, LV_PART_MAIN);
-  lv_obj_align(g_statusbar.ble_icon, LV_ALIGN_RIGHT_MID, -95, 0);
+  lv_obj_align(g_statusbar.ble_icon, LV_ALIGN_RIGHT_MID, -111, 0);
+
+  // microSD read/write activity LED — a small amber dot in the gap just left of
+  // the Wi-Fi glyph. Hidden when idle; UITask::loop lights it for ~180 ms after
+  // any SD access (markSdIo). A bg-coloured dot (not a glyph) keeps it tiny and
+  // unambiguous as an activity light, and costs no font space.
+  g_statusbar.sd_icon = lv_obj_create(g_statusbar.root);
+  lv_obj_remove_style_all(g_statusbar.sd_icon);
+  lv_obj_set_size(g_statusbar.sd_icon, 8, 8);
+  lv_obj_set_style_radius(g_statusbar.sd_icon, 4, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(g_statusbar.sd_icon, lv_color_hex(0xF5A623), LV_PART_MAIN);  // amber = SD activity
+  lv_obj_set_style_bg_opa(g_statusbar.sd_icon, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_clear_flag(g_statusbar.sd_icon, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_align(g_statusbar.sd_icon, LV_ALIGN_RIGHT_MID, -91, 0);
+  lv_obj_add_flag(g_statusbar.sd_icon, LV_OBJ_FLAG_HIDDEN);   // shown only during SD I/O
+
+  // Async mesh-request spinner — a refresh glyph centred in the bar, blinking
+  // while a request is in flight (UITask::loop drives it). Centre keeps it clear
+  // of both the left-zone title and the right-side icon cluster.
+  g_statusbar.async_icon = lv_label_create(g_statusbar.root);
+  lv_label_set_text(g_statusbar.async_icon, LV_SYMBOL_REFRESH);
+  lv_obj_set_style_text_font(g_statusbar.async_icon, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(g_statusbar.async_icon, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+  lv_obj_align(g_statusbar.async_icon, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_add_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);   // shown only while a request is in flight
 
   // ---- Mesh signal-strength bars (just left of the battery) ----
   // Four bars of increasing height; the lit count reflects the SNR of the last
@@ -21286,7 +22207,7 @@ static void buildGlobalStatusBar() {
   lv_label_set_text(g_statusbar.layout_label, TR(""));
   lv_obj_set_style_text_color(g_statusbar.layout_label, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.layout_label, &g_font_12, LV_PART_MAIN);
-  lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -150, 0);
+  lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -166, 0);   // follows the clock's shift
   lv_obj_add_flag(g_statusbar.layout_label, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -21365,6 +22286,12 @@ static void updateGlobalStatusBar() {
     if (tab == MAP_TAB_INDEX) {
       // On the immersive map the left zone carries the required OSM attribution.
       lv_label_set_text(g_statusbar.left_label, TR("\xC2\xA9 OpenStreetMap"));
+    } else if (tab == HOME_TAB_INDEX && touchPrefsGetHideNodeName()) {
+      // Display setting: hide the device name. Clear the left zone — the clock is
+      // parked here instead (see the clock-placement block below).
+      lv_label_set_text(g_statusbar.left_label, TR(""));
+      s_left_home_name[0] = '\0';   // force marquee re-config if the name returns
+      s_left_home_cfg = false;
     } else if (tab == HOME_TAB_INDEX) {
       // Home: the user's profile name, capped to a ~11-char-wide window. Longer
       // names marquee-scroll so they never run into the status icons. Reconfigure
@@ -21464,11 +22391,15 @@ static void updateGlobalStatusBar() {
       // left of the battery rightward to keep it snug against the bolt — else a
       // %-wide gap opens between the signal bars and the lightning glyph.
       const int d = charging ? 32 : 0;
+      // Base offsets MUST match the builder (which shifted for the SD LED): the
+      // SD dot is at -91, ble -111, clock -126, layout -166. The dot slides with
+      // the cluster too so it stays between Wi-Fi and Bluetooth while charging.
       if (g_statusbar.sig_box)      lv_obj_align(g_statusbar.sig_box,      LV_ALIGN_RIGHT_MID, -54  + d, 0);
       if (g_statusbar.conn_icon)    lv_obj_align(g_statusbar.conn_icon,    LV_ALIGN_RIGHT_MID, -73  + d, 0);
-      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -95  + d, 0);
-      if (g_statusbar.clock)        lv_obj_align(g_statusbar.clock,        LV_ALIGN_RIGHT_MID, -110 + d, 0);
-      if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -150 + d, 0);
+      if (g_statusbar.sd_icon)      lv_obj_align(g_statusbar.sd_icon,      LV_ALIGN_RIGHT_MID, -91  + d, 0);
+      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -111 + d, 0);
+      if (g_statusbar.clock)        lv_obj_align(g_statusbar.clock,        LV_ALIGN_RIGHT_MID, -126 + d, 0);
+      if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -166 + d, 0);
     }
     s_last_pct = pct;
     s_last_charging = charging;
@@ -21496,6 +22427,27 @@ static void updateGlobalStatusBar() {
     }
   }
 #endif
+
+  // ---- Clock placement ----
+  // With "hide device name" on, the clock sits CENTRED on every screen — clear of
+  // both the left-zone title (chat / Files / map credit) and the right-side icon
+  // cluster, so it never collides with e.g. the "Files" header. Otherwise it's
+  // top-right; charging slides it +32 to hug the bolt once the % column hides.
+  // Re-aligned only on a state change so it isn't laid out every tick.
+  {
+    static int8_t s_clk_center = -1;   // -1 = unset -> forces the first align
+    static bool   s_clk_chg     = false;
+    const int8_t want = touchPrefsGetHideNodeName() ? 1 : 0;
+    if (want != s_clk_center || (!want && charging != s_clk_chg)) {
+      s_clk_center = want; s_clk_chg = charging;
+      if (want) lv_obj_align(g_statusbar.clock, LV_ALIGN_CENTER, 0, 0);
+      else      lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, charging ? -94 : -126, 0);
+      // Park the async-request spinner just LEFT of the clock wherever it lands,
+      // so it never paints over the clock (incl. the centred hide-name mode).
+      if (g_statusbar.async_icon)
+        lv_obj_align_to(g_statusbar.async_icon, g_statusbar.clock, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+    }
+  }
 
   // ---- Layout indicator ----
   if (g_statusbar.layout_label) {
@@ -23147,11 +24099,536 @@ void UITask::onPingReply(const ContactInfo& contact, const uint8_t* data, size_t
   showAlert(msg, 5000);
 }
 
+// Telemetry response window — a dismissible card (same style as the map-options
+// popup) instead of a single-slot toast, so the full multi-line reading stays on
+// screen until tapped away and can scroll if it's long. Tap the dimmed backdrop
+// to close.
+#if defined(HAS_TDECK_GT911)   // telemetry window + per-node log/poll are SD-backed (T-Deck only)
+static lv_obj_t* s_telemetry_root    = nullptr;
+static lv_obj_t* s_telem_config_root = nullptr;   // settings panel spawned on top
+static lv_obj_t* s_telem_poll_ta     = nullptr;   // auto-poll interval input (config panel)
+static bool      s_telem_show_batt   = true;      // chart series visibility (session-scoped)
+static bool      s_telem_show_temp   = true;
+static bool      s_telem_show_hum    = true;
+static void openTelemetryConfigWindow();          // fwd
+static void telemetryConfigClose() {
+  if (s_telem_config_root) { lv_obj_del(s_telem_config_root); s_telem_config_root = nullptr; s_telem_poll_ta = nullptr; }
+}
+static void telemetryClose() {
+  telemetryConfigClose();
+  if (s_telemetry_root) { lv_obj_del(s_telemetry_root); s_telemetry_root = nullptr; }
+}
+static void telemetryWindowDismissCb(lv_event_t* e) {
+  if (lv_event_get_target(e) != s_telemetry_root) return;   // backdrop only
+  telemetryClose();
+}
+static void telemetryCloseCb(lv_event_t* e) { (void)e; telemetryClose(); }   // the X badge
+// ---------- Telemetry auto-poll (per node; persisted /meshcomod/telemetry/poll.cfg) ----------
+struct TelemPoll { uint8_t key[6]; uint16_t interval_min; uint32_t next_ms; bool used; };
+static const int      k_telem_poll_max = 8;
+static TelemPoll      s_telem_poll[k_telem_poll_max];
+static bool           s_telem_poll_loaded = false;
+
+static bool telemetryFindContact(const uint8_t* key6, ContactInfo* out) {
+  const uint32_t n = the_mesh.getNumContacts();
+  for (uint32_t i = 0; i < n; ++i) {
+    ContactInfo c; if (!the_mesh.getContactByIdx(i, c)) continue;
+    if (memcmp(c.id.pub_key, key6, 6) == 0) { *out = c; return true; }
+  }
+  return false;
+}
+static void telemetryPollLoad() {
+  if (s_telem_poll_loaded) return;
+  s_telem_poll_loaded = true;
+  for (auto& e : s_telem_poll) e.used = false;
+  if (SD.cardType() == CARD_NONE) return;
+  File f = SD.open("/meshcomod/telemetry/poll.cfg", FILE_READ);
+  if (!f) return;
+  int idx = 0;
+  while (f.available() && idx < k_telem_poll_max) {
+    String ln = f.readStringUntil('\n'); ln.trim();
+    if (ln.length() < 14) continue;                       // 12 hex + space + >=1 digit
+    TelemPoll& e = s_telem_poll[idx];
+    for (int b = 0; b < 6; ++b)
+      e.key[b] = (uint8_t)strtoul(ln.substring(b * 2, b * 2 + 2).c_str(), nullptr, 16);
+    const int mn = ln.substring(13).toInt();
+    if (mn <= 0) continue;
+    e.interval_min = (uint16_t)mn;
+    e.next_ms = millis() + 5000;                          // first poll shortly after load
+    e.used = true; ++idx;
+  }
+  f.close();
+}
+static void telemetryPollSave() {
+  if (SD.cardType() == CARD_NONE) return;
+  markSdIo();
+  SD.mkdir("/meshcomod");
+  SD.mkdir("/meshcomod/telemetry");
+  File f = SD.open("/meshcomod/telemetry/poll.cfg", FILE_WRITE);
+  if (!f) return;
+  for (auto& e : s_telem_poll)
+    if (e.used) f.printf("%02X%02X%02X%02X%02X%02X %u\n",
+                         e.key[0], e.key[1], e.key[2], e.key[3], e.key[4], e.key[5],
+                         (unsigned)e.interval_min);
+  f.close();
+}
+static int telemetryPollGet(const uint8_t* key6) {
+  telemetryPollLoad();
+  for (auto& e : s_telem_poll) if (e.used && memcmp(e.key, key6, 6) == 0) return e.interval_min;
+  return 0;
+}
+static void telemetryPollSet(const uint8_t* key6, int interval_min) {
+  telemetryPollLoad();
+  for (auto& e : s_telem_poll) if (e.used && memcmp(e.key, key6, 6) == 0) e.used = false;  // drop old
+  if (interval_min > 0)
+    for (auto& e : s_telem_poll) if (!e.used) {
+      memcpy(e.key, key6, 6); e.interval_min = (uint16_t)interval_min;
+      e.next_ms = millis() + 3000; e.used = true; break;
+    }
+  telemetryPollSave();
+}
+static void telemetryPollTick(uint32_t now_ms) {
+  if (SD.cardType() == CARD_NONE) return;
+  telemetryPollLoad();
+  for (auto& e : s_telem_poll) {
+    if (!e.used || (int32_t)(now_ms - e.next_ms) < 0) continue;
+    e.next_ms = now_ms + (uint32_t)e.interval_min * 60000u;
+    ContactInfo c;
+    if (telemetryFindContact(e.key, &c)) {
+      const int r = the_mesh.sendTelemetryRequestWithGuestLoginForUI(c);   // logged on reply; no window
+      if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) markMeshRequest();
+    }
+  }
+}
+
+// ---------- Telemetry window ----------
+static lv_obj_t* s_telem_now_ta  = nullptr;
+static lv_obj_t* s_telem_past_ta = nullptr;
+static void telemetryRebuild() {
+  openTelemetryWindow(s_telem_node, s_telem_name, s_telem_state);
+  if (s_telem_config_root) lv_obj_move_foreground(s_telem_config_root);   // keep the panel on top
+}
+static void telemWinApplyCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (s_telem_now_ta)  s_telem_win_now_h  = atoi(lv_textarea_get_text(s_telem_now_ta));
+  if (s_telem_past_ta) s_telem_win_past_h = atoi(lv_textarea_get_text(s_telem_past_ta));
+  if (s_telem_win_now_h  < 0) s_telem_win_now_h  = 0;
+  if (s_telem_win_past_h <= s_telem_win_now_h) s_telem_win_past_h = s_telem_win_now_h + 1;
+  telemetryRebuild();
+}
+// Send a telemetry request for the window's node now (the manual Request button —
+// the window no longer auto-requests on open). Mirrors actionSheetTelemetryCb's
+// send, but drives the telemetry window's own pending/deadline state.
+static void telemetryRequestNow() {
+  if (!g_lv.task) return;
+  ContactInfo c;
+  if (!telemetryFindContact(s_telem_node, &c)) { openTelemetryWindow(s_telem_node, s_telem_name, TELEM_FAILED); return; }
+  const int r = the_mesh.sendTelemetryRequestWithGuestLoginForUI(c);
+  s_telem_reading[0] = '\0';
+  if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+    s_telem_manual_pending = true;
+    s_telem_deadline_ms = millis() + UI_PING_TIMEOUT_MS;
+    markMeshRequest();
+    openTelemetryWindow(s_telem_node, s_telem_name, TELEM_IN_PROGRESS);
+  } else {
+    s_telem_manual_pending = false;
+    openTelemetryWindow(s_telem_node, s_telem_name, TELEM_FAILED);
+  }
+}
+static void telemReqCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  telemetryRequestNow();
+}
+// Config panel: gear opens it, a checkbox toggles a chart series, the textfield
+// sets the auto-poll interval.
+static void telemGearCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openTelemetryConfigWindow();
+}
+static void telemCfgDismissCb(lv_event_t* e) {
+  if (lv_event_get_target(e) != s_telem_config_root) return;   // backdrop only
+  telemetryConfigClose();
+  telemetryRebuild();
+}
+static void telemCfgCloseCb(lv_event_t* e) {
+  (void)e;
+  telemetryConfigClose();
+  telemetryRebuild();
+}
+static void telemShowToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  bool* flag = (bool*)lv_event_get_user_data(e);
+  if (flag) *flag = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  telemetryRebuild();      // redraw the chart immediately; the panel stays on top
+}
+static void telemPollApplyCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int mins = s_telem_poll_ta ? atoi(lv_textarea_get_text(s_telem_poll_ta)) : 0;
+  if (mins < 0)    mins = 0;
+  if (mins > 1440) mins = 1440;
+  telemetryPollSet(s_telem_node, mins);   // 0 disables auto-poll for this node
+}
+static void telemClearConfirmed() {
+  char path[40]; telemetryNodePath(s_telem_node, path, sizeof path);
+  if (SD.cardType() != CARD_NONE) { markSdIo(); SD.remove(path); }
+  telemetryRebuild();
+}
+static void telemClearCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  showConfirm(TR("Clear telemetry history for this node?"), TR("Clear"), telemClearConfirmed);
+}
+
+static void openTelemetryWindow(const uint8_t* key6, const char* name, int state) {
+  if (s_telemetry_root) { lv_obj_del(s_telemetry_root); s_telemetry_root = nullptr; }
+  s_telem_now_ta = s_telem_past_ta = nullptr;
+  if (key6 && key6 != s_telem_node) memcpy(s_telem_node, key6, 6);
+  if (name && name != s_telem_name) { strncpy(s_telem_name, name, sizeof s_telem_name - 1); s_telem_name[sizeof s_telem_name - 1] = '\0'; }
+  s_telem_state = state;
+
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_telemetry_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_telemetry_root);
+  lv_obj_set_size(s_telemetry_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_telemetry_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_telemetry_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_telemetry_root, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_clear_flag(s_telemetry_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_telemetry_root, telemetryWindowDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  const lv_coord_t cardw = sw - 16;
+  lv_obj_t* card = lv_obj_create(s_telemetry_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, cardw, sh - STATUSBAR_H - 12);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 6);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  addCloseXBadge(card, telemetryCloseCb);
+
+  // Gear (left of the X) opens the settings panel: show/hide data, auto-poll, clear.
+  {
+    lv_obj_t* gear = lv_obj_create(card);
+    lv_obj_remove_style_all(gear);
+    lv_obj_set_size(gear, 32, 32);
+    lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -34, 0);
+    lv_obj_set_style_bg_opa(gear, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(gear, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(gear, LV_OPA_20, LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_radius(gear, 16, LV_PART_MAIN);
+    lv_obj_add_flag(gear, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(gear, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(gear, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_clear_flag(gear, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(gear);
+    lv_obj_add_event_cb(gear, telemGearCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* gl = lv_label_create(gear);
+    lv_label_set_text(gl, LV_SYMBOL_SETTINGS);
+    lv_obj_set_style_text_font(gl, &g_font_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(gl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_align(gl, LV_ALIGN_TOP_RIGHT, -8, 4);
+  }
+
+  // Request (left of the gear) — same async-request glyph; sends a telemetry poll.
+  {
+    lv_obj_t* req = lv_obj_create(card);
+    lv_obj_remove_style_all(req);
+    lv_obj_set_size(req, 32, 32);
+    lv_obj_align(req, LV_ALIGN_TOP_RIGHT, -68, 0);
+    lv_obj_set_style_bg_opa(req, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(req, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(req, LV_OPA_20, LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_radius(req, 16, LV_PART_MAIN);
+    lv_obj_add_flag(req, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(req, LV_OBJ_FLAG_FLOATING);
+    lv_obj_add_flag(req, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_clear_flag(req, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(req);
+    lv_obj_add_event_cb(req, telemReqCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* rl = lv_label_create(req);
+    lv_label_set_text(rl, LV_SYMBOL_REFRESH);
+    lv_obj_set_style_text_font(rl, &g_font_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rl, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+    lv_obj_align(rl, LV_ALIGN_TOP_RIGHT, -8, 4);
+  }
+
+  // Header: name + state.
+  lv_obj_t* title = lv_label_create(card);
+  const char* stxt = (state == TELEM_IN_PROGRESS) ? "  \xe2\x80\x94 requesting\xe2\x80\xa6"
+                   : (state == TELEM_FAILED)      ? "  \xe2\x80\x94 last request failed" : "";
+  lv_label_set_text_fmt(title, "%s%s", name && name[0] ? name : "node", stxt);
+  lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(state == TELEM_FAILED ? 0xE08080 : COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_width(title, cardw - 20 - 98);   // clear the request, gear and X badges
+  lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(title, 0, 0);
+  int y = 22;
+  if (state == TELEM_RECEIVED && s_telem_reading[0]) {
+    lv_obj_t* rl = lv_label_create(card);
+    lv_label_set_long_mode(rl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(rl, cardw - 20);
+    lv_label_set_text(rl, s_telem_reading);
+    lv_obj_set_style_text_font(rl, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(rl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_pos(rl, 0, y);
+    lv_obj_update_layout(rl);                  // measure the wrapped height so the chart clears it
+    y += lv_obj_get_height(rl) + 6;
+  }
+
+  // ---- Read the per-node log into the chosen display window ----
+  static const int k_max = 300;
+  static uint16_t mvs[k_max]; static int16_t t10s[k_max]; static int16_t hums[k_max];
+  int n = 0;
+  const uint32_t now = (uint32_t)time(nullptr);
+  const uint32_t age_lo = (uint32_t)s_telem_win_now_h  * 3600u;
+  const uint32_t age_hi = (uint32_t)s_telem_win_past_h * 3600u;
+  if (SD.cardType() != CARD_NONE) {
+    markSdIo();
+    char path[40]; telemetryNodePath(s_telem_node, path, sizeof path);
+    File rf = SD.open(path, FILE_READ);
+    if (rf) {
+      while (rf.available() && n < k_max) {
+        String ln = rf.readStringUntil('\n');
+        if (ln.length() == 0) continue;
+        const uint32_t ep = (uint32_t)strtoul(ln.c_str(), nullptr, 10);
+        if (now > 1700000000 && ep != 0) {
+          const uint32_t age = (now > ep) ? (now - ep) : 0;
+          if (age < age_lo || age > age_hi) continue;          // outside the display window
+        }
+        const int t1 = ln.indexOf('\t');
+        const int t2 = (t1 >= 0) ? ln.indexOf('\t', t1 + 1) : -1;
+        const int t3 = (t2 >= 0) ? ln.indexOf('\t', t2 + 1) : -1;
+        const int t4 = (t3 >= 0) ? ln.indexOf('\t', t3 + 1) : -1;
+        if (t2 < 0 || t3 < 0 || t4 < 0) continue;
+        mvs[n]  = (uint16_t)ln.substring(t2 + 1, t3).toInt();
+        t10s[n] = (int16_t)ln.substring(t3 + 1, t4).toInt();
+        hums[n] = (int16_t)ln.substring(t4 + 1).toInt();
+        ++n;
+      }
+      rf.close();
+    }
+  }
+
+  // ---- Chart (battery V left; temperature + humidity right) ----
+  const int chart_x = 30, chart_rpad = 30, chart_h = 108;
+  lv_obj_t* chart = nullptr;
+  if (n > 0) {
+    chart = lv_chart_create(card);
+    lv_obj_set_size(chart, cardw - 20 - chart_x - chart_rpad, chart_h);
+    lv_obj_set_pos(chart, chart_x, y + 4);
+    lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
+    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(chart, n);
+    lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y,   3400, 4700);   // battery mV (blue)
+    lv_chart_set_range(chart, LV_CHART_AXIS_SECONDARY_Y,  -20,  100);   // temp degC + humidity %
+    lv_chart_set_div_line_count(chart, 4, 6);
+    lv_obj_set_style_bg_color(chart, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(chart, lv_color_hex(0x18191A), LV_PART_MAIN);
+    lv_obj_set_style_border_width(chart, 1, LV_PART_MAIN);
+    lv_obj_set_style_radius(chart, 6, LV_PART_MAIN);
+    lv_obj_set_style_line_color(chart, lv_color_hex(0x1A1D1F), LV_PART_MAIN);
+    lv_obj_set_style_size(chart, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_pad_top(chart, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(chart, 6, LV_PART_MAIN);
+    lv_obj_set_style_text_font(chart, &g_font_12, LV_PART_TICKS);
+    lv_obj_set_style_text_color(chart, lv_color_hex(COLOR_SUB), LV_PART_TICKS);
+    lv_obj_set_style_line_color(chart, lv_color_hex(0x2A2E30), LV_PART_TICKS);
+    lv_obj_set_style_pad_left(chart, 4, LV_PART_TICKS);
+    lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_Y,   4, 0, 4, 1, true, 40);
+    lv_chart_set_axis_tick(chart, LV_CHART_AXIS_SECONDARY_Y, 4, 0, 4, 1, true, 36);
+    lv_obj_add_event_cb(chart, battChartTickCb, LV_EVENT_DRAW_PART_BEGIN, nullptr);   // primary -> volts
+    // Only the series the user opted to show (toggled in the settings panel).
+    lv_chart_series_t* bs = s_telem_show_batt ? lv_chart_add_series(chart, lv_color_hex(0x4F9DF7), LV_CHART_AXIS_PRIMARY_Y)   : nullptr;  // battery blue
+    lv_chart_series_t* ts = s_telem_show_temp ? lv_chart_add_series(chart, lv_color_hex(0xF5A623), LV_CHART_AXIS_SECONDARY_Y) : nullptr;  // temp orange
+    lv_chart_series_t* hs = s_telem_show_hum  ? lv_chart_add_series(chart, lv_color_hex(0x35C9C9), LV_CHART_AXIS_SECONDARY_Y) : nullptr;  // humidity cyan
+    for (int i = 0; i < n; ++i) {
+      if (bs) { lv_coord_t v = (lv_coord_t)mvs[i]; if (v > 4700) v = 4700; lv_chart_set_next_value(chart, bs, mvs[i] > 0 ? v : LV_CHART_POINT_NONE); }
+      if (ts)   lv_chart_set_next_value(chart, ts, t10s[i] > -3000 ? (lv_coord_t)(t10s[i] / 10) : LV_CHART_POINT_NONE);
+      if (hs)   lv_chart_set_next_value(chart, hs, hums[i] >= 0     ? (lv_coord_t)hums[i] : LV_CHART_POINT_NONE);
+    }
+    // legend (only the visible series)
+    char leg[112]; leg[0] = '\0';
+    if (s_telem_show_batt) strcat(leg, "#4F9DF7 \xe2\x97\x8f# V   ");
+    if (s_telem_show_temp) strcat(leg, "#F5A623 \xe2\x97\x8f# \xc2\xb0""C   ");
+    if (s_telem_show_hum)  strcat(leg, "#35C9C9 \xe2\x97\x8f# %RH");
+    if (!leg[0]) strcpy(leg, "#808080 (nothing shown \xe2\x80\x94 enable a series in settings)#");
+    lv_obj_t* lg = lv_label_create(card);
+    lv_label_set_recolor(lg, true);
+    lv_label_set_text(lg, leg);
+    lv_obj_set_style_text_font(lg, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lg, lv_color_hex(COLOR_SUB), LV_PART_MAIN);   // match the axis notes (not dark)
+    lv_obj_align_to(lg, chart, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+    y += chart_h + 28;   // clear the chart + its legend line
+  } else {
+    lv_obj_t* none = lv_label_create(card);
+    lv_label_set_text(none, TR("No telemetry in this window.\nRequest one, or widen the range below."));
+    lv_obj_set_style_text_color(none, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_style_text_font(none, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_pos(none, 0, y + 6);
+    y += 44;
+  }
+
+  // ---- Display-window fields: description on its own line, inputs on the next ----
+  // "from" = older bound (larger hours-ago), "to" = newer bound (smaller). Auto-poll,
+  // visibility toggles and clear-history all live in the settings panel (gear).
+  {
+    lv_obj_t* lab = lv_label_create(card);
+    lv_label_set_text(lab, TR("Time range (hours ago)"));
+    lv_obj_set_style_text_font(lab, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lab, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_pos(lab, 0, y);
+    y += 18;
+
+    lv_obj_t* lf = lv_label_create(card);
+    lv_label_set_text(lf, TR("from"));
+    lv_obj_set_style_text_font(lf, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lf, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_pos(lf, 0, y + 8);
+    s_telem_past_ta = lv_textarea_create(card);
+    lv_textarea_set_one_line(s_telem_past_ta, true);
+    lv_textarea_set_accepted_chars(s_telem_past_ta, "0123456789");
+    lv_textarea_set_max_length(s_telem_past_ta, 4);
+    lv_obj_set_width(s_telem_past_ta, 44); lv_obj_set_pos(s_telem_past_ta, 38, y);
+    attachSettingsTaEvents(s_telem_past_ta);
+    char b1[8]; snprintf(b1, sizeof b1, "%d", s_telem_win_past_h); lv_textarea_set_text(s_telem_past_ta, b1);
+
+    lv_obj_t* lt = lv_label_create(card);
+    lv_label_set_text(lt, TR("h  to"));
+    lv_obj_set_style_text_font(lt, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lt, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_pos(lt, 88, y + 8);
+    s_telem_now_ta = lv_textarea_create(card);
+    lv_textarea_set_one_line(s_telem_now_ta, true);
+    lv_textarea_set_accepted_chars(s_telem_now_ta, "0123456789");
+    lv_textarea_set_max_length(s_telem_now_ta, 4);
+    lv_obj_set_width(s_telem_now_ta, 44); lv_obj_set_pos(s_telem_now_ta, 132, y);
+    attachSettingsTaEvents(s_telem_now_ta);
+    char b0[8]; snprintf(b0, sizeof b0, "%d", s_telem_win_now_h); lv_textarea_set_text(s_telem_now_ta, b0);
+
+    lv_obj_t* lh = lv_label_create(card);
+    lv_label_set_text(lh, TR("h"));
+    lv_obj_set_style_text_font(lh, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lh, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_pos(lh, 182, y + 8);
+
+    lv_obj_t* showb = lv_btn_create(card);
+    lv_obj_set_size(showb, 64, 32); lv_obj_set_pos(showb, 200, y);
+    styleButton(showb);
+    lv_obj_add_event_cb(showb, telemWinApplyCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* sl = lv_label_create(showb); lv_label_set_text(sl, TR("Show")); lv_obj_center(sl);
+    y += 42;
+  }
+}
+
+// Settings panel for the telemetry window: which series to chart, the auto-poll
+// interval (manual minutes; 0 = off), and a clear-history button. Spawned on top
+// of the telemetry window; toggling a checkbox redraws the chart underneath live.
+static void openTelemetryConfigWindow() {
+  if (s_telem_config_root) { lv_obj_del(s_telem_config_root); s_telem_config_root = nullptr; s_telem_poll_ta = nullptr; }
+  const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  const lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_telem_config_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_telem_config_root);
+  lv_obj_set_size(s_telem_config_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_telem_config_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_telem_config_root, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_telem_config_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_telem_config_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_telem_config_root, telemCfgDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  const lv_coord_t cardw = sw - 48;
+  lv_obj_t* card = lv_obj_create(s_telem_config_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, cardw, LV_SIZE_CONTENT);
+  lv_obj_set_style_max_height(card, sh - STATUSBAR_H - 24, LV_PART_MAIN);
+  lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 16);
+  styleSurface(card, COLOR_PANEL, 8);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  addCloseXBadge(card, telemCfgCloseCb);
+
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text(title, TR("Telemetry settings"));
+  lv_obj_set_style_text_font(title, &g_font_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(title, 0, 0);
+  int y = 30;
+
+  // --- Show on chart (checkboxes) ---
+  lv_obj_t* sh1 = lv_label_create(card);
+  lv_label_set_text(sh1, TR("Show on chart"));
+  lv_obj_set_style_text_font(sh1, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sh1, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(sh1, 0, y);
+  y += 18;
+
+  auto add_check = [&](const char* txt, bool* flag) {
+    lv_obj_t* cb = lv_checkbox_create(card);
+    lv_checkbox_set_text(cb, txt);
+    lv_obj_set_style_text_color(cb, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(cb, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_radius(cb, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_border_color(cb, lv_color_hex(COLOR_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(cb, 1, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(cb, lv_color_hex(0x4F9DF7), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(cb, LV_OPA_COVER, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(cb, lv_color_white(), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (*flag) lv_obj_add_state(cb, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(cb, telemShowToggleCb, LV_EVENT_VALUE_CHANGED, flag);
+    lv_obj_set_pos(cb, 4, y);
+    y += 30;
+  };
+  add_check(TR("Battery (V)"),  &s_telem_show_batt);
+  add_check(TR("Temperature"),  &s_telem_show_temp);
+  add_check(TR("Humidity"),     &s_telem_show_hum);
+  y += 6;
+
+  // --- Auto-poll (manual minutes; 0 = off) ---
+  lv_obj_t* sh2 = lv_label_create(card);
+  lv_label_set_text(sh2, TR("Auto-poll every"));
+  lv_obj_set_style_text_font(sh2, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(sh2, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(sh2, 0, y + 8);
+  s_telem_poll_ta = lv_textarea_create(card);
+  lv_textarea_set_one_line(s_telem_poll_ta, true);
+  lv_textarea_set_accepted_chars(s_telem_poll_ta, "0123456789");
+  lv_textarea_set_max_length(s_telem_poll_ta, 4);
+  lv_obj_set_width(s_telem_poll_ta, 56); lv_obj_set_pos(s_telem_poll_ta, 120, y);
+  attachSettingsTaEvents(s_telem_poll_ta);
+  { char pb[8]; snprintf(pb, sizeof pb, "%d", telemetryPollGet(s_telem_node)); lv_textarea_set_text(s_telem_poll_ta, pb); }
+  lv_obj_t* mlab = lv_label_create(card);
+  lv_label_set_text(mlab, TR("min (0=off)"));
+  lv_obj_set_style_text_font(mlab, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(mlab, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(mlab, 182, y + 8);
+  lv_obj_t* ap = lv_btn_create(card);
+  lv_obj_set_size(ap, cardw - 24, 32); lv_obj_set_pos(ap, 0, y + 42);
+  styleButton(ap);
+  lv_obj_set_style_bg_color(ap, lv_color_hex(COLOR_STATUS_OK), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(ap, LV_OPA_40, LV_PART_MAIN);
+  lv_obj_add_event_cb(ap, telemPollApplyCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* apl = lv_label_create(ap); lv_label_set_text(apl, TR("Apply auto-poll")); lv_obj_center(apl);
+  y += 86;
+
+  // --- Clear history ---
+  lv_obj_t* clr = lv_btn_create(card);
+  lv_obj_set_size(clr, cardw - 24, 32); lv_obj_set_pos(clr, 0, y);
+  styleButton(clr);
+  lv_obj_set_style_bg_color(clr, lv_color_hex(0xB23A48), LV_PART_MAIN);
+  lv_obj_add_event_cb(clr, telemClearCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cl = lv_label_create(clr); lv_label_set_text(cl, LV_SYMBOL_TRASH "  Clear history"); lv_obj_center(cl);
+}
+#endif  // HAS_TDECK_GT911 (telemetry window)
+
 // Decode a CayenneLPP-formatted telemetry response into a human-readable
-// toast. Walks the channels with LPPReader and concatenates whatever common
+// window. Walks the channels with LPPReader and concatenates whatever common
 // fields the payload contains (voltage / temperature / humidity / pressure /
-// GPS / etc). Unknown channels are skipped via LPPReader::skipData. The
-// alert is capped at 5 s because the touch panel only has one toast slot.
+// GPS / etc). Unknown channels are skipped via LPPReader::skipData.
 void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
   s_ui_ping_deadline_ms = 0;  // reply arrived, cancel timeout
   char nm[24];
@@ -23173,6 +24650,8 @@ void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, s
     return (p >= 0 && (size_t)p < body_cap) ? (body_cap - (size_t)p) : 0;
   };
   bool any = false;
+  // Captured for the per-node telemetry log (sentinels = sensor absent).
+  int tl_mv = 0, tl_t10 = -30000, tl_h = -1;
   // Cap len to 0xFF so LPPReader's uint8_t length doesn't truncate weirdly.
   uint8_t rd_len = (len > 250) ? 250 : (uint8_t)len;
   LPPReader rd(data, rd_len);
@@ -23182,16 +24661,19 @@ void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, s
     switch (type) {
       case LPP_VOLTAGE: {
         float v = 0; if (!rd.readVoltage(v)) goto done;
+        tl_mv = (int)(v * 1000.0f + 0.5f);
         if (bodyRoom()) p += snprintf(body + p, bodyRoom(), "%s%.2fV", sep, (double)v);
         any = true; break;
       }
       case LPP_TEMPERATURE: {
         float t = 0; if (!rd.readTemperature(t)) goto done;
+        tl_t10 = (int)lroundf(t * 10.0f);
         if (bodyRoom()) p += snprintf(body + p, bodyRoom(), "%s%.1f\xc2\xb0\x43", sep, (double)t);
         any = true; break;
       }
       case LPP_RELATIVE_HUMIDITY: {
         float h = 0; if (!rd.readRelativeHumidity(h)) goto done;
+        tl_h = (int)lroundf(h);
         if (bodyRoom()) p += snprintf(body + p, bodyRoom(), "%s%.0f%%RH", sep, (double)h);
         any = true; break;
       }
@@ -23269,6 +24751,10 @@ void UITask::onTelemetryReply(const ContactInfo& contact, const uint8_t* data, s
     if (p > 0 && (size_t)p >= body_cap - 1) break;   // body buffer full
   }
 done: {
+#if defined(HAS_TDECK_GT911)
+  // Log every reply (manual or auto-poll) to the per-node telemetry file.
+  if (any) telemetryLogAppend(contact.id.pub_key, (uint32_t)time(nullptr), tl_mv, tl_t10, tl_h);
+#endif
   // Always also include a short hex dump so we can compare what the
   // decoder produced against the raw wire bytes. Helps spot wrap/offset
   // errors and unknown LPP types in one shot.
@@ -23287,7 +24773,19 @@ done: {
     snprintf(msg, sizeof(msg), "%s: %uB %s",
              nm, (unsigned)len, hex);
   }
-  showAlert(msg, 7000);
+#if defined(HAS_TDECK_GT911)
+  // Update the telemetry window ONLY for the node it's showing, and only when a
+  // manual request is in flight — auto-poll just logs (above) without a window.
+  if (s_telem_manual_pending && memcmp(s_telem_node, contact.id.pub_key, 6) == 0) {
+    strncpy(s_telem_reading, msg, sizeof s_telem_reading - 1);
+    s_telem_reading[sizeof s_telem_reading - 1] = '\0';
+    s_telem_manual_pending = false;
+    s_telem_deadline_ms = 0;
+    if (s_telemetry_root) openTelemetryWindow(s_telem_node, s_telem_name, TELEM_RECEIVED);
+  }
+#else
+  showAlert(msg, 7000);   // non-SD build: no per-node window, keep the toast
+#endif
 }
 }
 
@@ -24367,6 +25865,9 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
     _sensors->setSettingValue("gps", "1");
   }
   s_tiles_from_sd = touchPrefsGetTilesFromSd();   // map tile source: server (default) vs microSD
+  s_map_night = touchPrefsGetMapNight();          // map night mode (render-time tile invert)
+  { const uint8_t pz = touchPrefsGetMapZoom();    // restore the last user-set map zoom
+    if (pz >= k_map_zoom_min && pz <= k_map_zoom_max) s_map_zoom = pz; }
 #if defined(ESP32)
   // Bump the CPU above the 80 MHz base-config default. The base was
   // chosen for power on a headless companion build; on a touch device
@@ -25559,6 +27060,15 @@ void UITask::loop() {
     snprintf(msg, sizeof(msg), TR("No reply from %s"), s_ui_ping_target_name);
     showAlert(msg, 3500);
   }
+#if defined(HAS_TDECK_GT911)
+  // Manual telemetry request timed out — flip the open window to "failed" (it
+  // still shows the history). Auto-poll has no deadline, so it never lands here.
+  if (s_telem_manual_pending && s_telem_deadline_ms != 0 && now >= s_telem_deadline_ms) {
+    s_telem_manual_pending = false;
+    s_telem_deadline_ms = 0;
+    if (s_telemetry_root) openTelemetryWindow(s_telem_node, s_telem_name, TELEM_FAILED);
+  }
+#endif
 
   /* User button (BOOT / PIN_USER_BTN): press toggles the screen. When the
    * panel is off it wakes + resets the idle timer; when on it locks
@@ -25868,6 +27378,10 @@ void UITask::loop() {
     }
   }
 
+  batteryLogTick((uint32_t)now);   // 5-min battery sample (SD on T-Deck, else SPIFFS)
+#if defined(HAS_TDECK_GT911)
+  telemetryPollTick((uint32_t)now); // auto-poll due nodes -> log (no window)
+#endif
   versionCheckService(now);   // firmware update check (gear badge + About line)
   refreshSysInfo(now);        // live uptime / heap on the About sub-tab
   wifiScanService();          // draw Wi-Fi scan results when the worker finishes
@@ -25884,7 +27398,9 @@ void UITask::loop() {
     if (indev && lv_indev_get_scroll_obj(indev) != nullptr) {
       s_tabbar_lock_until = now + 350;
     }
-    const bool want_lock = (now < s_tabbar_lock_until);
+    // Also hard-lock the tab bar while Snake is open so a swipe/tap near the
+    // bottom can't slip through to the app switcher (e.g. into the map).
+    const bool want_lock = (now < s_tabbar_lock_until) || SnakeGame::isOpen();
     if (want_lock != s_tabbar_locked && g_lv.tabview) {
       lv_obj_t* tab_btns = lv_tabview_get_tab_btns(g_lv.tabview);
       if (tab_btns) {
@@ -25892,6 +27408,41 @@ void UITask::loop() {
         else           lv_obj_add_flag(tab_btns, LV_OBJ_FLAG_CLICKABLE);
         s_tabbar_locked = want_lock;
       }
+    }
+  }
+
+  // microSD activity LED: lit for k_sd_io_led_ms after the last SD access
+  // (markSdIo). Edge-triggered — LVGL is only touched when the lit/dark state
+  // flips, so an idle device costs one comparison per loop and nothing else.
+  if (g_statusbar.sd_icon) {
+    static int8_t s_sd_led = -1;   // -1 = unset -> forces the initial sync
+    const bool lit = (g_sd_io_ms != 0) &&
+                     ((uint32_t)(now - g_sd_io_ms) < k_sd_io_led_ms);
+    if ((int8_t)lit != s_sd_led) {
+      s_sd_led = lit;
+      if (lit) lv_obj_clear_flag(g_statusbar.sd_icon, LV_OBJ_FLAG_HIDDEN);
+      else     lv_obj_add_flag(g_statusbar.sd_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  // Async mesh-request spinner: blink the centre glyph while a request is sending
+  // or awaiting a reply (recent markMeshRequest, a pending UI reply, or the LOS
+  // worker). Cheap — a blink toggle, no animation.
+  if (g_statusbar.async_icon) {
+    const bool active = (g_mesh_req_ms != 0 && (uint32_t)(now - g_mesh_req_ms) < 1500u)
+                        || (s_ui_ping_deadline_ms != 0) || s_los_busy;
+    static bool     s_async_shown = false;
+    static uint32_t s_async_blink = 0;
+    if (active) {
+      if ((uint32_t)(now - s_async_blink) >= 350u) {
+        s_async_blink = (uint32_t)now;
+        s_async_shown = !s_async_shown;
+        if (s_async_shown) lv_obj_clear_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);
+        else               lv_obj_add_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);
+      }
+    } else if (!lv_obj_has_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN)) {
+      s_async_shown = false;
+      lv_obj_add_flag(g_statusbar.async_icon, LV_OBJ_FLAG_HIDDEN);
     }
   }
 
