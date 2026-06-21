@@ -1,0 +1,73 @@
+{
+  "maker": {
+    "wadamesh": {
+      "name": "wadamesh"
+    }
+  },
+  "device": [
+    {
+      "maker": "wadamesh",
+      "class": "wadamesh",
+      "name": "wadamesh — Heltec V4 TFT",
+      "type": "esp32",
+      "tooltip": "<img class='device' src='https://wadamesh.com/wadamesh-icon-512.png'>",
+      "firmware": [
+        {
+          "role": "gui",
+          "title": "Touch UI",
+          "version": {
+            "beta_9": {
+              "notes": "Wi-Fi now reconnects on its own after the link drops — no more rebooting just to get back online\nFixed a bug where a corrupted chat-history file could make the device reboot on every received message (and hide your messages) — the bad file is now detected and reset automatically so it recovers on its own\nHardened the boot path so a device with quirky memory degrades gracefully instead of getting stuck on the boot logo\nAfter a crash, Settings -> About now shows an \"Export crash report\" button that saves the crash dump to the microSD card, so you can send it to the devs and get the bug fixed\nThe reload button for corrupt tiles now actually clears the cached tiles — including when you're offline — and missing/blank \"twilight zone\" tiles re-download on their own\nFixed tiles not re-fetching at zoom levels 13 to 15\nFavourited contacts now always appear in the contact list, even with hundreds of similarly-named contacts (they used to stay hidden until you searched for them)\nRoom-server messages now show the time each message was actually sent, instead of when it arrived\nRoom-server messages now show who sent them\nSharing your contact QR code now produces a valid code that the MeshCore phone app can scan and import\nUnread counts now show \"99+\" instead of an alarming raw number on busy channels\nNew icon-size setting: tap the cog at the top-right of the app drawer to switch between Compact and Large — bigger icons and labels, easier to read\nSmoother scrolling through the app list (and the other scrollable lists)",
+              "files": [
+                {
+                  "type": "flash-wipe",
+                  "name": "wadamesh-heltec-v4-tft-merged.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_9/wadamesh-heltec-v4-tft-merged.bin",
+                  "title": "Full install (bootloader + firmware)"
+                },
+                {
+                  "type": "flash-update",
+                  "name": "wadamesh-heltec-v4-tft.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_9/wadamesh-heltec-v4-tft.bin",
+                  "title": "Update (app only)"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "maker": "wadamesh",
+      "class": "wadamesh",
+      "name": "wadamesh — LilyGo T-Deck",
+      "type": "esp32",
+      "tooltip": "<img class='device' src='https://wadamesh.com/wadamesh-icon-512.png'>",
+      "firmware": [
+        {
+          "role": "gui",
+          "title": "Touch UI",
+          "version": {
+            "beta_9": {
+              "notes": "Wi-Fi now reconnects on its own after the link drops — no more rebooting just to get back online\nFixed a bug where a corrupted chat-history file could make the device reboot on every received message (and hide your messages) — the bad file is now detected and reset automatically so it recovers on its own\nHardened the boot path so a device with quirky memory degrades gracefully instead of getting stuck on the boot logo\nAfter a crash, Settings -> About now shows an \"Export crash report\" button that saves the crash dump to the microSD card, so you can send it to the devs and get the bug fixed\nThe reload button for corrupt tiles now actually clears the cached tiles — including when you're offline — and missing/blank \"twilight zone\" tiles re-download on their own\nFixed tiles not re-fetching at zoom levels 13 to 15\nFavourited contacts now always appear in the contact list, even with hundreds of similarly-named contacts (they used to stay hidden until you searched for them)\nRoom-server messages now show the time each message was actually sent, instead of when it arrived\nRoom-server messages now show who sent them\nSharing your contact QR code now produces a valid code that the MeshCore phone app can scan and import\nUnread counts now show \"99+\" instead of an alarming raw number on busy channels\nNew icon-size setting: tap the cog at the top-right of the app drawer to switch between Compact and Large — bigger icons and labels, easier to read\nSmoother scrolling through the app list (and the other scrollable lists)",
+              "files": [
+                {
+                  "type": "flash-wipe",
+                  "name": "wadamesh-tdeck-merged.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_9/wadamesh-tdeck-merged.bin",
+                  "title": "Full install (bootloader + firmware)"
+                },
+                {
+                  "type": "flash-update",
+                  "name": "wadamesh-tdeck.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_9/wadamesh-tdeck.bin",
+                  "title": "Update (app only)"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
