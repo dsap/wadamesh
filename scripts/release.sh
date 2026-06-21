@@ -54,6 +54,28 @@ echo "listing: $(python3 -c 'import json,sys;print(", ".join(x["name"] for x in 
 #     frozen one. Notes come from release-notes/<tag>.txt (one per line; optional).
 python3 "$ROOT/scripts/build/gen-flasher-meta.py" "$TAG" "$LATEST" "$ROOT/release-notes/$TAG.txt"
 
+# 3c. Mesh America Configurator provider catalog (apps.meshamerica.com — the web
+#     flasher Cascadia Mesh uses). It is served LIVE from raw.githubusercontent
+#     main, so each release must regenerate it for $TAG and push that ONE file to
+#     main; otherwise the configurator keeps offering the previous beta. It points
+#     at the immutable /releases/TOUCH/$TAG/ bins published below.
+#     (Generator: deploy/gen-meshamerica-catalog.py — reads release-notes/$TAG.txt.)
+CATALOG="$ROOT/deploy/meshamerica-catalog.json"
+python3 "$ROOT/deploy/gen-meshamerica-catalog.py" "$TAG" > "$CATALOG.tmp" && mv "$CATALOG.tmp" "$CATALOG"
+mkdir -p "$OUT/meshamerica" && cp "$CATALOG" "$OUT/meshamerica/catalog.json"   # also mirror to the VPS (enables the branded URL once its nginx location is deployed)
+if git -C "$ROOT" diff --quiet -- "$CATALOG"; then
+  echo "Mesh America catalog already current for $TAG"
+elif [ "$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" = "main" ]; then
+  if git -C "$ROOT" commit -q -m "chore: refresh Mesh America catalog for $TAG" -- "$CATALOG" \
+       && git -C "$ROOT" push origin HEAD:main; then
+    echo "Mesh America catalog refreshed + pushed to main ($TAG)"
+  else
+    echo "WARN: Mesh America catalog commit/push failed — push deploy/meshamerica-catalog.json to main by hand"
+  fi
+else
+  echo "NOTE: regenerated $CATALOG for $TAG but not on 'main' — commit + push it to main so apps.meshamerica.com updates."
+fi
+
 # 4. Publish to the VPS (Cloudflare caches at the edge).
 if [ -n "$DEST" ]; then
   rsync -av "$OUT/" "$DEST:$DEST_PATH/"
