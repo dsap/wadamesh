@@ -1,4 +1,5 @@
 #include "UITask.h"
+#include "TouchSleep.h"
 
 #include "../MyMesh.h"
 
@@ -295,6 +296,12 @@ extern "C" const lv_font_t person_font14;   // 14 px — for g_font_14 (chat lis
 // own one-glyph font, spliced into the g_font_16 fallback chain like person_font.
 extern "C" const lv_font_t zoom_font;
 #define TOUCH_SYM_ZOOM    "\xEF\x80\x82"   /* U+F002 magnifying-glass */
+// FontAwesome sun (U+F185) + moon (U+F186) for sleep-state markers. Spliced into
+// the g_font_12, g_font_14, and g_font_16 chains in initTouchFontFallbacks so the
+// glyphs render at any of those sizes (the status-bar sleep icon uses g_font_12;
+// the battery-chart sleep markers will use g_font_14).
+extern "C" const lv_font_t sleepicons_font;
+#define TOUCH_SYM_MOON "\xEF\x86\x86"   /* U+F186 moon */
 
 // Extras fallback fonts — em-dash (U+2014), ellipsis (U+2026), middle dot
 // (U+00B7). LVGL's stock Montserrat subset doesn't include these, so any
@@ -365,6 +372,22 @@ static void initTouchFontFallbacks() {
   s_zoom_font = zoom_font;
   s_zoom_font.fallback = g_font_16.fallback;
   g_font_16.fallback = &s_zoom_font;
+  // Sleep-state icons: sun (U+F185) + moon (U+F186). Spliced into all three
+  // chains — g_font_12 for the status-bar sleep indicator, g_font_14 for the
+  // battery-chart sleep markers, g_font_16 for any larger context. A single font
+  // object can only sit in one chain at a time; use distinct static copies.
+  static lv_font_t s_sleep_font_12;
+  s_sleep_font_12 = sleepicons_font;
+  s_sleep_font_12.fallback = g_font_12.fallback;
+  g_font_12.fallback = &s_sleep_font_12;
+  static lv_font_t s_sleep_font_14;
+  s_sleep_font_14 = sleepicons_font;
+  s_sleep_font_14.fallback = g_font_14.fallback;
+  g_font_14.fallback = &s_sleep_font_14;
+  static lv_font_t s_sleep_font_16;
+  s_sleep_font_16 = sleepicons_font;
+  s_sleep_font_16.fallback = g_font_16.fallback;
+  g_font_16.fallback = &s_sleep_font_16;
   // Also reach the person/antenna/group glyphs from g_font_14 — the contact
   // action sheet title and the Chats-list rows render the icon inline with 14 px
   // text. Use the 14 px-rendered person_font14 (NOT the 16 px person_font) so the
@@ -563,6 +586,7 @@ struct GlobalStatusBar {
   lv_obj_t* left_label;
   lv_obj_t* conn_icon;       // Wi-Fi glyph
   lv_obj_t* ble_icon;        // Bluetooth glyph (separate from Wi-Fi)
+  lv_obj_t* sleep_icon;      // idle light-sleep readiness indicator (T-Deck only)
   lv_obj_t* sd_icon;         // microSD read/write activity LED (left of Wi-Fi)
   lv_obj_t* async_icon;      // async mesh-request spinner glyph (centre, transient)
   lv_obj_t* clock;
@@ -575,6 +599,8 @@ struct GlobalStatusBar {
 };
 static GlobalStatusBar g_statusbar = {};
 static void updateGlobalStatusBar();   // fwd decl, called from refresh tick
+static const char* tsBlockReason();    // fwd decl (defined near idle-sleep hooks)
+static const char* tsWakeReasonStr(touchSleep::WakeReason r);  // fwd decl (defined near idle-sleep hooks)
 
 // microSD read/write activity. markSdIo() stamps the time of the last SD access
 // (SD-backed tile cache, SD tile packs, file manager, mount). UITask::loop lights
@@ -769,6 +795,8 @@ static uint32_t  s_live_diag_reads = 0;
 static uint32_t  s_live_diag_pressed = 0;
 static uint32_t  s_live_diag_tap_edges = 0;
 static unsigned long s_live_diag_next_ms = 0;
+// File-scope so tsNextWakeForcingDueMs can read it; initialised at first loop tick (~4 s).
+static unsigned long s_sig_probe_at = 4000;
 /** Keep live diag overlay available but hidden by default; flip true for field debugging. */
 constexpr bool k_show_live_diag_overlay = false;
 
@@ -1777,6 +1805,10 @@ static lv_obj_t* s_tab_indicator    = nullptr;   // thin rounded accent glow bar
 static lv_obj_t* s_update_subtab_badge = nullptr;// red dot over the "About" sub-tab button
 static lv_obj_t* s_update_about_lbl = nullptr;   // status line on the About sub-tab
 static lv_obj_t* s_sysinfo_lbl      = nullptr;   // System-info text (refreshed live on the About tab)
+#if defined(HAS_TDECK_GT911)
+static lv_obj_t* s_sleep_diag_lbl  = nullptr;   // Idle-sleep instrumentation label (Lock settings, line 1)
+static lv_obj_t* s_sleep_diag_lbl2 = nullptr;   // Idle-sleep instrumentation label (Lock settings, line 2)
+#endif
 static bool      s_update_available = false;
 static bool      s_verchk_ran       = false;     // a check has completed (ok or failed)
 static volatile bool s_verchk_request  = false;  // UI -> core-0 worker: please check
@@ -5648,6 +5680,37 @@ static void refreshSysInfo(unsigned long now) {
   lv_label_set_text(s_sysinfo_lbl, buf);
 }
 
+#if defined(HAS_TDECK_GT911)
+// Re-render the idle-sleep instrumentation labels ~1 Hz while the Lock settings
+// panel is open. Mirrors the refreshSysInfo() guard: skip if the right sheet is
+// not visible, or while the user is mid-scroll (avoids layout churn).
+static void refreshSleepDiag(unsigned long now) {
+  static unsigned long next = 0;
+  if ((long)(now - next) < 0) return;
+  if (!s_sleep_diag_lbl || !s_sleep_diag_lbl2 ||
+      getActiveTab() != SETTINGS_TAB_INDEX || s_settings_open_cat != CAT_LOCK) {
+    next = now + 1000;
+    return;
+  }
+  for (lv_indev_t* in = lv_indev_get_next(nullptr); in; in = lv_indev_get_next(in)) {
+    if (lv_indev_get_scroll_dir(in) != LV_DIR_NONE) { next = now + 120; return; }
+  }
+  next = now + 1000;
+
+  char buf[64];
+  snprintf(buf, sizeof buf, "%s · cycles %lu · asleep %u%%",
+           touchSleep::isSleeping() ? "sleeping" : "awake",
+           (unsigned long)touchSleep::wakeCount(),
+           (unsigned)touchSleep::pctAsleep());
+  lv_label_set_text(s_sleep_diag_lbl, buf);
+
+  char buf2[48];
+  snprintf(buf2, sizeof buf2, "%s%s",
+           TR("last wake: "), tsWakeReasonStr(touchSleep::lastWakeReason()));
+  lv_label_set_text(s_sleep_diag_lbl2, buf2);
+}
+#endif  // HAS_TDECK_GT911
+
 static void buildSystemInfoSettings() {
   lv_obj_t* body = createSettingsModal("System info", SettingsModalKind::SystemInfo);
   char buf[800];
@@ -5738,6 +5801,21 @@ static void clock12hToggleCb(lv_event_t* e) {
 }
 
 // Hard-lock (not just dim) when the screen idles off, so the touchscreen is
+#if defined(HAS_TDECK_GT911)
+// Toggle idle light-sleep via the Settings row. Updates NVS, the live
+// touchSleep state, and the status-bar icon in one shot (mirrors lockOnScreenOffToggleCb).
+static void sleepIdleToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetSleepIdle(on);
+#endif
+  touchSleep::setEnabled(on);
+  updateGlobalStatusBar();
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("Idle sleep enabled") : TR("Idle sleep disabled"), 1200);
+}
+#endif
+
 // inert until a deliberate unlock. Cached in s_lock_on_screen_off so the loop's
 // idle check never hits NVS.
 static void lockOnScreenOffToggleCb(lv_event_t* e) {
@@ -6432,6 +6510,75 @@ static void buildDeviceSettings(int sec) {
     lv_obj_add_event_cb(sw, lockOnScreenOffToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(40, h + 12);
   }
+
+#if defined(HAS_TDECK_GT911)
+  /* Idle power-save: park the CPU in light sleep while the screen is off,
+     no clients are connected, and all radios are quiet. The SX1262 DIO1 IRQ
+     (GPIO45) wakes on each received packet; RAM / LVGL UI survive (light sleep
+     only, NOT deep sleep). */
+  {
+    // Toggle row — initial state from NVS.
+    int h = settingsRowLabel(body, y, 6, "Idle power-save", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetSleepIdle()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, sleepIdleToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(40, h + 12);
+
+    // Dynamic status subtext: blocking reason, or "Ready" when all gates pass.
+    {
+      const char* reason = tsBlockReason();
+      y += settingsRowLabel(body, y, 0,
+          reason ? reason : TR("Ready"),
+          COLOR_SUB, &g_font_12, 0) + 6;
+    }
+
+    // Static informational caption: why deep sleep is not available.
+    y += settingsRowLabel(body, y, 0,
+        TR("Throttles the CPU when idle (screen off, on battery, standalone) to save power"),
+        COLOR_SUB, &g_font_12, 0) + 6;
+
+    // Idle-sleep instrumentation: live counters (state · wake count · % asleep)
+    // and the last-wake reason. Two labels stored in s_sleep_diag_lbl[2] so that
+    // refreshSleepDiag() can update them ~1 Hz while the Lock panel is open,
+    // matching the same live-label pattern used for the About/sysinfo block.
+    {
+      char buf[64];
+      snprintf(buf, sizeof buf, "%s · cycles %lu · asleep %u%%",
+               touchSleep::isSleeping() ? "sleeping" : "awake",
+               (unsigned long)touchSleep::wakeCount(),
+               (unsigned)touchSleep::pctAsleep());
+
+      lv_obj_t* lbl1 = lv_label_create(body);
+      s_sleep_diag_lbl = lbl1;
+      lv_obj_set_width(lbl1, lv_pct(100));
+      lv_obj_set_pos(lbl1, 4, y);
+      lv_obj_set_style_text_font(lbl1, &g_font_12, LV_PART_MAIN);
+      lv_obj_set_style_text_color(lbl1, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+      lv_label_set_long_mode(lbl1, LV_LABEL_LONG_WRAP);
+      lv_label_set_text(lbl1, buf);
+      lv_obj_update_layout(lbl1);
+      y += lv_obj_get_height(lbl1) + 4;
+
+      char buf2[48];
+      snprintf(buf2, sizeof buf2, "%s%s",
+               TR("last wake: "), tsWakeReasonStr(touchSleep::lastWakeReason()));
+
+      lv_obj_t* lbl2 = lv_label_create(body);
+      s_sleep_diag_lbl2 = lbl2;
+      lv_obj_set_width(lbl2, lv_pct(100));
+      lv_obj_set_pos(lbl2, 4, y);
+      lv_obj_set_style_text_font(lbl2, &g_font_12, LV_PART_MAIN);
+      lv_obj_set_style_text_color(lbl2, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+      lv_label_set_long_mode(lbl2, LV_LABEL_LONG_WRAP);
+      lv_label_set_text(lbl2, buf2);
+      lv_obj_update_layout(lbl2);
+      y += lv_obj_get_height(lbl2) + 6;
+    }
+  }
+#endif
 
   }
 
@@ -10207,7 +10354,6 @@ static void batteryCpuToggleCb(lv_event_t* e) {
   openBatteryChartWindow();          // redraw immediately with the new visibility
 }
 
-// Build the 24h battery-voltage chart popup from the SD log.
 // Reformat the battery chart's primary-Y axis ticks from raw millivolts to volts
 // (e.g. 4200 -> "4.2"). Secondary-Y (CPU MHz) keeps the raw number. RF-monitor
 // pattern: hook DRAW_PART_BEGIN and rewrite the tick label buffer.
@@ -10449,6 +10595,38 @@ static void openBatteryChartWindow() {
   lv_obj_set_style_text_font(cpul, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(cpul, lv_color_hex(s_batt_show_cpu ? 0xFFFFFF : COLOR_SUB), LV_PART_MAIN);
   lv_obj_center(cpul);
+
+  // ---- Idle power-save stats (snapshot mirror of the Lock-settings diag; the
+  // chart itself is a snapshot too, so this refreshes each time the window opens).
+  // Same two lines as refreshSleepDiag(): state / wakes / % asleep, then last-wake. ----
+  by += 8;
+  lv_obj_t* slph = lv_label_create(card);
+  lv_label_set_text(slph, TR("Idle power-save"));
+  lv_obj_set_style_text_font(slph, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(slph, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_pos(slph, 0, by);
+  by += 18;
+
+  char slp1[64];
+  snprintf(slp1, sizeof slp1, "%s \xc2\xb7 cycles %lu \xc2\xb7 asleep %u%%",
+           touchSleep::isSleeping() ? "sleeping" : "awake",
+           (unsigned long)touchSleep::wakeCount(),
+           (unsigned)touchSleep::pctAsleep());
+  lv_obj_t* slp1l = lv_label_create(card);
+  lv_label_set_text(slp1l, slp1);
+  lv_obj_set_style_text_font(slp1l, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(slp1l, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_width(slp1l, cardw - 20);
+  lv_label_set_long_mode(slp1l, LV_LABEL_LONG_WRAP);
+  lv_obj_set_pos(slp1l, 0, by);
+  by += 18;
+
+  lv_obj_t* slp2l = lv_label_create(card);
+  lv_label_set_text_fmt(slp2l, "%s%s", TR("last wake: "), tsWakeReasonStr(touchSleep::lastWakeReason()));
+  lv_obj_set_style_text_font(slp2l, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(slp2l, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(slp2l, 0, by);
+  by += 18;
 }
 
 static void batteryTapCb(lv_event_t* e) {
@@ -17239,8 +17417,11 @@ static void applyMapChrome(bool on) {
     if (g_statusbar.batt_icon)  lv_obj_set_style_text_color(g_statusbar.batt_icon, fg, LV_PART_MAIN);
     if (g_statusbar.batt_pct)   lv_obj_set_style_text_color(g_statusbar.batt_pct, fg_sub, LV_PART_MAIN);
     if (g_statusbar.clock)      lv_obj_set_style_text_color(g_statusbar.clock, fg_sub, LV_PART_MAIN);
-    if (g_statusbar.conn_icon)  lv_obj_set_style_text_color(g_statusbar.conn_icon, fg_sub, LV_PART_MAIN);
-    if (g_statusbar.ble_icon)   lv_obj_set_style_text_color(g_statusbar.ble_icon, fg_sub, LV_PART_MAIN);
+    if (g_statusbar.conn_icon)   lv_obj_set_style_text_color(g_statusbar.conn_icon,  fg_sub, LV_PART_MAIN);
+    if (g_statusbar.ble_icon)    lv_obj_set_style_text_color(g_statusbar.ble_icon,   fg_sub, LV_PART_MAIN);
+#if defined(HAS_TDECK_GT911)
+    if (g_statusbar.sleep_icon)  lv_obj_set_style_text_color(g_statusbar.sleep_icon, fg_sub, LV_PART_MAIN);
+#endif
   }
   // ---- Tab bar (bottom menu) — translucent so the map shows through ----
   if (g_lv.tabview) {
@@ -17968,6 +18149,11 @@ static void closeSettingsCategory() {
     s_ota_btn = nullptr; s_ota_btn_lbl = nullptr;
     g_lv.settings_status = nullptr; g_lv.diag_id_label = nullptr; g_lv.diag_label = nullptr;
   }
+#if defined(HAS_TDECK_GT911)
+  if (s_settings_open_cat == CAT_LOCK) {   // null the sleep-diag live-label ptrs
+    s_sleep_diag_lbl = nullptr; s_sleep_diag_lbl2 = nullptr;
+  }
+#endif
   s_settings_inline_parent = nullptr;
   // del_async, NOT del: the sheet holds the scrollable page, and this close can
   // fire mid-gesture (swipe-back / tab change while a settings page has scroll
@@ -22621,6 +22807,86 @@ static void takeScreenshotToSd() {
 #endif
 }
 
+// ---- Idle power-save hooks (see TouchSleep.h) ----
+// Called by touchSleep::gatePasses(); each hook probes the relevant subsystem.
+static bool tsScreenOff()  { return g_lv.task && g_lv.task->isScreenOff(); }
+static bool tsNoClient()   { return the_mesh.getProtoNumClients() == 0; }   // public accessor (proto_num_clients is private)
+// tsWifiOff: true only when the WiFi radio is actually powered off — the pref
+// wifiConfigGetRadioEnabled() is the source of truth (wifiConfigApply() drives
+// WiFi.mode(WIFI_OFF) when it is false).  WiFi.status() != WL_CONNECTED was
+// the previous check but returns true even while the modem is powered and scanning.
+static bool tsWifiOff()    { return !wifiConfigGetRadioEnabled() && WiFi.getMode() == WIFI_OFF; }
+// tsBleOff: true when no BLE capability is enabled (mirrors the ble_up flag in
+// updateGlobalStatusBar — hasBleCapability() && isBleEnabled()).
+static bool tsBleOff()     {
+  return !(g_lv.task && g_lv.task->hasBleCapability() && g_lv.task->isBleEnabled());
+}
+// tsOnBattery: true when NOT charging (mirrors the charging bool in updateGlobalStatusBar
+// — batteryIsCharging(batteryMvSmoothed())).
+static bool tsOnBattery()  { return !batteryIsCharging(batteryMvSmoothed()); }
+// tsMeshIdle: true when the radio is NOT mid-receive (preamble→RxDone race guarded),
+// AND no outbound packets are queued / no dirty contacts expiry is pending.
+// hasPendingWork() checks _mgr->getOutboundTotal() + dirty_contacts_expiry.
+// isRadioReceiving() delegates to Dispatcher::_radio->isReceiving() (RadioLibWrapper override).
+static bool tsMeshIdle()   { return !the_mesh.hasPendingWork() && !the_mesh.isRadioReceiving(); }
+// tsNextWakeForcingDueMs: advert/sig-probe is the only wake-forcing deadline today;
+// clock alarms TBD.  s_sig_probe_at is promoted to file scope so we can read it here.
+static uint32_t tsNextWakeForcingDueMs(uint32_t now_ms) {
+  if (s_sig_probe_at == 0) return UINT32_MAX;
+  return (uint32_t)(s_sig_probe_at > now_ms ? (s_sig_probe_at - now_ms) : 0);
+}
+static uint32_t tsEpochNow() { return (uint32_t)time(nullptr); }
+
+// tsBlockReason: returns nullptr when the gate would pass once the screen dims
+// (i.e. the device is ready to idle-sleep); else returns the highest-priority
+// blocking condition as a human-readable string for the status-bar toast.
+// "feature disabled" is NOT a blocking reason — the caller hides the icon instead.
+static const char* tsBlockReason() {
+  if (!touchSleep::enabled())  return nullptr;          // hidden, not blocked
+  if (!tsOnBattery())          return TR("USB powered");
+  if (!tsWifiOff())            return TR("Wi-Fi on");
+  if (!tsBleOff())             return TR("BLE on");
+  if (!tsNoClient())           return TR("client connected");
+  if (!tsMeshIdle())           return TR("mesh busy");
+  return nullptr;   // ready — only screen-off remains for the gate to pass
+}
+
+// tsWakeReasonStr: human-readable label for each WakeReason enum value, shown in
+// the idle-sleep diag panel so the user can see *why* the device last woke.
+// "-" is the sentinel for WakeReason::None (no wake yet since boot).
+static const char* tsWakeReasonStr(touchSleep::WakeReason r) {
+  using WR = touchSleep::WakeReason;
+  switch (r) {
+    case WR::Timer:  return "timer";
+    case WR::Packet: return "packet";
+    case WR::Touch:  return "touch";
+    case WR::Button: return "button";
+    case WR::Other:  return "other";
+    default:         return "-";
+  }
+}
+
+static void uiInstallTouchSleepHooks() {
+  touchSleep::Hooks h{};
+  h.screenOff = tsScreenOff;  h.noClient = tsNoClient;
+  h.wifiOff = tsWifiOff;      h.bleOff = tsBleOff;
+  h.onBattery = tsOnBattery;  h.meshIdle = tsMeshIdle;
+  h.nextWakeForcingDueMs = tsNextWakeForcingDueMs;
+  h.epochNow = tsEpochNow;
+  touchSleep::begin(h);
+}
+
+#if defined(HAS_TDECK_GT911)
+// Tap on the sleep readiness icon: toast the current blocking reason so the
+// user knows WHY the device won't idle-sleep yet (mirrors batteryTapCb shape).
+static void sleepIconTapCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (!g_lv.task) return;
+  const char* reason = tsBlockReason();
+  g_lv.task->showAlert(reason ? reason : TR("Sleep ready"), 1600);
+}
+#endif
+
 // Build the always-on status bar. Called once from UITask::begin after
 // lv_init. Lives on lv_layer_sys so it sits above lv_layer_top (modals,
 // keyboard mirror) — guarantees the time/battery are visible everywhere.
@@ -22698,7 +22964,7 @@ static void buildGlobalStatusBar() {
   lv_label_set_text(g_statusbar.clock, TR("--:--"));
   lv_obj_set_style_text_color(g_statusbar.clock, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.clock, &g_font_12, LV_PART_MAIN);
-  lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, -126, 0);   // shifted left to free a slot for the SD LED
+  lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, -142, 0);   // shifted left for the SD LED + sleep moon
 
   // Wi-Fi glyph (right of the Bluetooth glyph, left of the signal bars).
   g_statusbar.conn_icon = lv_label_create(g_statusbar.root);
@@ -22712,7 +22978,24 @@ static void buildGlobalStatusBar() {
   lv_label_set_text(g_statusbar.ble_icon, TR(""));
   lv_obj_set_style_text_color(g_statusbar.ble_icon, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.ble_icon, &g_font_12, LV_PART_MAIN);
-  lv_obj_align(g_statusbar.ble_icon, LV_ALIGN_RIGHT_MID, -111, 0);
+  lv_obj_align(g_statusbar.ble_icon, LV_ALIGN_RIGHT_MID, -127, 0);
+
+#if defined(HAS_TDECK_GT911)
+  // Idle power-save readiness indicator — eye-close glyph left of the clock.
+  // Visible only when the feature is enabled; accent colour = ready, grey = blocked.
+  g_statusbar.sleep_icon = lv_label_create(g_statusbar.root);
+  lv_label_set_text(g_statusbar.sleep_icon, TOUCH_SYM_MOON);
+  lv_obj_set_style_text_color(g_statusbar.sleep_icon, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_style_text_font(g_statusbar.sleep_icon, &g_font_12, LV_PART_MAIN);
+  // Left of the SD-activity LED (ble/clock/layout were shifted left to open this
+  // slot). Tracks the charging d-shift like the rest of the cluster, and stays clear
+  // of the async-request glyph, which rides just left of the clock.
+  lv_obj_align(g_statusbar.sleep_icon, LV_ALIGN_RIGHT_MID, -105, 0);
+  lv_obj_add_flag(g_statusbar.sleep_icon, LV_OBJ_FLAG_HIDDEN);     // hidden until feature is on
+  lv_obj_add_flag(g_statusbar.sleep_icon, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(g_statusbar.sleep_icon, 8);
+  lv_obj_add_event_cb(g_statusbar.sleep_icon, sleepIconTapCb, LV_EVENT_CLICKED, nullptr);
+#endif
 
   // microSD read/write activity LED — a small amber dot in the gap just left of
   // the Wi-Fi glyph. Hidden when idle; UITask::loop lights it for ~180 ms after
@@ -22767,7 +23050,7 @@ static void buildGlobalStatusBar() {
   lv_label_set_text(g_statusbar.layout_label, TR(""));
   lv_obj_set_style_text_color(g_statusbar.layout_label, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.layout_label, &g_font_12, LV_PART_MAIN);
-  lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -166, 0);   // follows the clock's shift
+  lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -182, 0);   // follows the clock's shift
   lv_obj_add_flag(g_statusbar.layout_label, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -22912,6 +23195,25 @@ static void updateGlobalStatusBar() {
   }
 #endif
 
+#if defined(HAS_TDECK_GT911)
+  // ---- Idle power-save icon ---- (T-Deck only; predicates live in the same
+  // HAS_TDECK_GT911 build environment as the actual light-sleep execution)
+  if (g_statusbar.sleep_icon) {
+    if (!touchSleep::enabled()) {
+      // Feature off — hide entirely; no status to convey.
+      lv_obj_add_flag(g_statusbar.sleep_icon, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_clear_flag(g_statusbar.sleep_icon, LV_OBJ_FLAG_HIDDEN);
+      const char* reason = tsBlockReason();
+      // Ready = accent colour (same warm highlight used for active glyphs elsewhere
+      // in the bar). Blocked = muted grey (COLOR_SUB) so it reads as "paused".
+      lv_obj_set_style_text_color(g_statusbar.sleep_icon,
+          lv_color_hex(reason == nullptr ? COLOR_ACCENT : (uint32_t)COLOR_SUB),
+          LV_PART_MAIN);
+    }
+  }
+#endif
+
   // ---- Mesh signal strength ---- (SNR of the last packet we heard; dims when
   // nothing's been heard for a while. The periodic zero-hop "discover" advert in
   // UITask::loop keeps it fresh by prompting nearby nodes/repeaters.)
@@ -22959,9 +23261,10 @@ static void updateGlobalStatusBar() {
       if (g_statusbar.sig_box)      lv_obj_align(g_statusbar.sig_box,      LV_ALIGN_RIGHT_MID, -54  + d, 0);
       if (g_statusbar.conn_icon)    lv_obj_align(g_statusbar.conn_icon,    LV_ALIGN_RIGHT_MID, -73  + d, 0);
       if (g_statusbar.sd_icon)      lv_obj_align(g_statusbar.sd_icon,      LV_ALIGN_RIGHT_MID, -91  + d, 0);
-      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -111 + d, 0);
-      if (g_statusbar.clock)        lv_obj_align(g_statusbar.clock,        LV_ALIGN_RIGHT_MID, -126 + d, 0);
-      if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -166 + d, 0);
+      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -127 + d, 0);
+      if (g_statusbar.clock)        lv_obj_align(g_statusbar.clock,        LV_ALIGN_RIGHT_MID, -142 + d, 0);
+      if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -182 + d, 0);
+      if (g_statusbar.sleep_icon)   lv_obj_align(g_statusbar.sleep_icon,   LV_ALIGN_RIGHT_MID, -105 + d, 0);
     }
     s_last_pct = pct;
     s_last_charging = charging;
@@ -23003,7 +23306,7 @@ static void updateGlobalStatusBar() {
     if (want != s_clk_center || (!want && charging != s_clk_chg)) {
       s_clk_center = want; s_clk_chg = charging;
       if (want) lv_obj_align(g_statusbar.clock, LV_ALIGN_CENTER, 0, 0);
-      else      lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, charging ? -94 : -126, 0);
+      else      lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, charging ? -110 : -142, 0);
       // Park the async-request spinner just LEFT of the clock wherever it lands,
       // so it never paints over the clock (incl. the centred hide-name mode).
       if (g_statusbar.async_icon)
@@ -26865,6 +27168,12 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   g_lv.dirty_timeline     = true;
   g_lv.defer_heavy_refresh = false;
   g_lv.heavy_refresh_at_ms = 0;
+  // Wire the idle light-sleep predicate hooks once the UI is fully initialised.
+  // All hooks are installed here so main.cpp can call touchSleep::loopEnd() on
+  // every loop tick without a separate begin() site in main.cpp.
+  uiInstallTouchSleepHooks();
+  // Restore the persisted on/off state (default OFF until the user enables it).
+  touchSleep::setEnabled(touchPrefsGetSleepIdle());
 #endif
 }
 
@@ -27961,7 +28270,8 @@ void UITask::loop() {
   // they produce nothing for us to measure.) The user can turn the probe off or
   // change its poll interval from the home-graph "Signal & traffic" popup.
   {
-    static unsigned long s_sig_probe_at = 4000;   // first attempt ~4 s after boot
+    // s_sig_probe_at is file-scope (promoted for tsNextWakeForcingDueMs); no re-init here.
+    (void)0;  // placeholder — variable declared at file scope above
     if ((long)(now - s_sig_probe_at) >= 0) {
       if (touchPrefsGetSigProbeEnabled()) {
         const uint32_t poll_ms = (uint32_t)touchPrefsGetSigPollMins() * 60000UL;  // minutes -> ms
@@ -27983,6 +28293,9 @@ void UITask::loop() {
 #endif
   versionCheckService(now);   // firmware update check (gear badge + About line)
   refreshSysInfo(now);        // live uptime / heap on the About sub-tab
+#if defined(HAS_TDECK_GT911)
+  refreshSleepDiag(now);     // live sleep counters on the Lock settings panel
+#endif
   wifiScanService();          // draw Wi-Fi scan results when the worker finishes
   ctDeleteServiceTick();      // chunked contacts bulk-delete (advances the progress bar)
 

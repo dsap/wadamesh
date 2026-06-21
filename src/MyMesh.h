@@ -780,6 +780,16 @@ public:
   // To check if there is pending work
   bool hasPendingWork() const;
 
+  // Number of companion clients currently connected on any transport.
+  // Used by the idle light-sleep gate (TouchSleep) to confirm no one is
+  // actively talking to us before the node parks in light sleep.
+  int getProtoNumClients() const { return proto_num_clients; }
+
+  // True if the radio is currently mid-receive of a packet (preamble→RxDone).
+  // _radio is the protected Dispatcher::Radio pointer; isReceiving() returns false
+  // by default and is overridden by RadioLibWrapper with a real preamble-detect check.
+  bool isRadioReceiving() const { return _radio && _radio->isReceiving(); }
+
 private:
   void writeOKFrame();
   void writeErrFrame(uint8_t err_code);
