@@ -153,6 +153,13 @@ bool touchPrefsSetHideNodeName(bool hide);
 bool touchPrefsGetNewContactToast();
 bool touchPrefsSetNewContactToast(bool on);
 
+/** Heltec V4 Expansion Kit only: show the bottom "Sensors" tab + the Home
+ *  environment widget. Default true. Combined with a runtime check for any
+ *  ENVIRONMENT sensor actually being present, so a bare V4 hides the UI even
+ *  with this on. Read in buildUiTree → applies after a restart. */
+bool touchPrefsGetShowSensorsTab();
+bool touchPrefsSetShowSensorsTab(bool on);
+
 /** Store all device data (identity/prefs/contacts/channels) on the SD card under
  *  /meshcomod instead of internal SPIFFS. T-Deck only; read at boot before data
  *  loads, so changing it requires a reboot. Default false (SPIFFS). */

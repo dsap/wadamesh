@@ -712,9 +712,17 @@ constexpr int CONTACTS_TAB_INDEX     = 1;
 constexpr int HOME_TAB_INDEX         = 2;
 constexpr int MAP_TAB_INDEX          = 3;
 #if defined(HAS_EXPANSION_KIT)
-constexpr int SENSORS_TAB_INDEX      = 4;
-constexpr int SETTINGS_TAB_INDEX     = 5;
-constexpr int TAB_LAST               = 5;
+// Runtime (not constexpr): the Sensors tab is only inserted when an environment
+// sensor is present AND the user pref is on (see sensorsUiWanted()), so its
+// index — and Settings' index after it — are decided in buildUiTree. Defaults
+// here are the "no Sensors tab" layout (Settings at 4); buildUiTree promotes
+// them to 4/5 when the Sensors tab is added. SENSORS_TAB_INDEX = -1 means
+// "absent", so every `== SENSORS_TAB_INDEX` refresh check simply never matches.
+// These are only ever read as plain ints (comparisons / nav args), so mutable
+// is fine; CHAT/CONTACTS/HOME/MAP stay constexpr.
+static int SENSORS_TAB_INDEX  = -1;
+static int SETTINGS_TAB_INDEX = 4;
+static int TAB_LAST           = 4;
 #else
 constexpr int SETTINGS_TAB_INDEX     = 4;
 constexpr int TAB_LAST               = 4;
@@ -1496,6 +1504,24 @@ static unsigned long s_home_env_last_sample_ms = 0;
 static bool localEnvHasAnySensors(const UITask::LocalEnvSnapshot& snap) {
   return snap.have_batt || snap.have_bme_temp || snap.have_bme_hum || snap.have_bme_pressure ||
          snap.have_bme_alt || snap.have_gxhtv3_temp || snap.have_gxhtv3_hum || snap.gps_present;
+}
+
+// True only when an actual ENVIRONMENT module (BME280 ch2 / GXHTV3 ch3) is
+// detected. Deliberately excludes the battery rail + GPS, which are present on a
+// bare V4 — those make localEnvHasAnySensors() always true, so it can't gate the
+// Sensors UI. Used to auto-hide the Sensors tab + Home env widget when no
+// environment sensors are attached.
+static bool localEnvHasEnvSensors(const UITask::LocalEnvSnapshot& snap) {
+  return snap.have_bme_temp || snap.have_bme_hum || snap.have_bme_pressure ||
+         snap.have_bme_alt || snap.have_gxhtv3_temp || snap.have_gxhtv3_hum;
+}
+
+// Cached once at the top of buildUiTree (a sensor probe is too heavy to repeat
+// per-frame). sensorsUiWanted() = this AND the user pref. Both default to a
+// "show" state so behaviour is unchanged when an env sensor is connected.
+static bool s_env_sensors_present = false;
+static inline bool sensorsUiWanted() {
+  return s_env_sensors_present && touchPrefsGetShowSensorsTab();
 }
 
 static const char* localEnvModuleState(bool detected, bool query_ok) {
@@ -4936,7 +4962,10 @@ static void updateTabIndicator() {
   if (idx == MAP_TAB_INDEX) { lv_obj_add_flag(s_tab_indicator, LV_OBJ_FLAG_HIDDEN); return; }
   const lv_coord_t sw = lv_disp_get_hor_res(nullptr);
 #if defined(HAS_EXPANSION_KIT)
-  const int cell = sw / 6;                       // 6 equal tab cells (Sensors added)
+  // Tab count is runtime: 6 cells with the Sensors tab, 5 without (TAB_LAST is 5
+  // or 4 accordingly). Using (TAB_LAST + 1) keeps the indicator centred under the
+  // active tab in either layout.
+  const int cell = sw / (TAB_LAST + 1);          // equal tab cells (Sensors present or not)
   const int xoff = cell * idx + cell/2 - sw/2;   // center of tab idx relative to screen mid
 #else
   const int cell = sw / 5;                 // 5 equal tab cells
@@ -7378,6 +7407,21 @@ static void colorfulBubblesToggleCb(lv_event_t* e) {
                                       on ? 1500 : 900);
 }
 
+#if defined(HAS_EXPANSION_KIT)
+// V4 Expansion Kit: show/hide the Sensors tab + Home env widget. The tab layout
+// is decided in buildUiTree, so this only persists the pref and prompts for a
+// restart (it intentionally does not rebuild the live tree).
+static void showSensorsTabToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetShowSensorsTab(on);
+#endif
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("Sensors tab: on (restart to apply)")
+                                         : TR("Sensors tab: off (restart to apply)"), 1800);
+}
+#endif
+
 // Accent-popup picker on/off. Persisted + live: gates accentBoxMaybeShow() so
 // the tap-to-pick accent box stops appearing as you type. Default ON.
 static void accentPopupsToggleCb(lv_event_t* e) {
@@ -8066,6 +8110,24 @@ static void buildDeviceSettings(int sec) {
     lv_obj_add_event_cb(sw, hideNameToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(40, h + 12);
   }
+
+#if defined(HAS_EXPANSION_KIT)
+  /* Show Sensors tab (V4 Expansion Kit): toggles the bottom Sensors tab + the
+     Home env widget. Also auto-hidden when no environment sensor is attached.
+     The tab layout is decided at boot, so this applies after a restart. */
+  {
+    int h = settingsRowLabel(body, y, 6, "Show Sensors tab", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+#if defined(ESP32)
+    if (touchPrefsGetShowSensorsTab()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+#endif
+    lv_obj_add_event_cb(sw, showSensorsTabToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(40, h + 12);
+    // Subtitle: this only takes effect on the next boot (tabs are built once).
+    y += settingsRowLabel(body, y, 0, "Applies after restart.", COLOR_SUB, &g_font_12, 0) + 6;
+  }
+#endif
 
   /* Theme colour (UI accent): opens a colour-wheel + hex picker. The chosen
      colour is clamped dark enough that off-white button text stays readable. */
@@ -15439,6 +15501,10 @@ static void makeHome(lv_obj_t* tab) {
 #if defined(HAS_EXPANSION_KIT)
   // Expansion Kit: tappable local-env summary line + a tiny batt/temp/hum
   // history chart on Home. Tapping either opens the detailed Local-Sensors page.
+  // Only built when an env sensor is present and the pref is on; otherwise the
+  // env label/chart stay null (reset above) and the TX/RX chart below uses the
+  // normal non-Expansion chart_y, so Home looks like a plain build.
+  if (sensorsUiWanted()) {
   g_lv.home_env = lv_label_create(tab);
   lv_label_set_text(g_lv.home_env, TR(""));
   lv_obj_set_style_text_color(g_lv.home_env, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
@@ -15477,6 +15543,7 @@ static void makeHome(lv_obj_t* tab) {
   lv_chart_set_all_value(s_home_env_chart, s_home_env_batt, LV_CHART_POINT_NONE);
   lv_chart_set_all_value(s_home_env_chart, s_home_env_temp, LV_CHART_POINT_NONE);
   lv_chart_set_all_value(s_home_env_chart, s_home_env_hum, LV_CHART_POINT_NONE);
+  }  // sensorsUiWanted()
 #endif  // HAS_EXPANSION_KIT
 
   // TX / RX rolling chart. 60 samples, two series (TX green, RX blue).
@@ -15492,7 +15559,11 @@ static void makeHome(lv_obj_t* tab) {
   // (env label at SC(58), env chart at SC(92)); relayoutHomeCharts() then
   // re-flows the TX/RX legend + chart + advert button to the measured bottom.
 #if defined(HAS_EXPANSION_KIT)
-  const int chart_y = SC(138);
+  // With the env widget present, push the TX/RX chart down to clear the env
+  // label (SC(58)) + env chart (SC(92)). With it hidden, sit at the normal
+  // non-Expansion offset so Home matches a plain build. (relayoutHomeCharts()
+  // re-flows everything when the env widget exists, and no-ops when it doesn't.)
+  const int chart_y = sensorsUiWanted() ? SC(138) : SC(60);
 #else
   const int chart_y = SC(60);
 #endif
@@ -27806,6 +27877,18 @@ static void buildUiTree() {
   // Always boot to the Home tab (the last-used tab is no longer restored).
   uint8_t saved_tab = HOME_TAB_INDEX;
 
+#if defined(HAS_EXPANSION_KIT)
+  // Probe the local env sensors ONCE here and cache the result. sensorsUiWanted()
+  // (this AND the user pref) then decides whether the Sensors tab + Home env
+  // widget are built. Re-probing per frame would hammer the I2C bus.
+  s_env_sensors_present = false;
+  if (g_lv.task) {
+    UITask::LocalEnvSnapshot snap;
+    g_lv.task->getLocalEnvSnapshot(snap);
+    s_env_sensors_present = localEnvHasEnvSensors(snap);
+  }
+#endif
+
   // Load the saved theme accent before any widget is built so the whole tree
   // adopts it. g_lv.tabview/keyboard are still null here, so applyAccent only
   // sets the colour globals (no live re-style needed at boot).
@@ -27884,7 +27967,21 @@ static void buildUiTree() {
   lv_obj_t* tab_home     = lv_tabview_add_tab(g_lv.tabview, LV_SYMBOL_HOME);
   lv_obj_t* tab_map      = lv_tabview_add_tab(g_lv.tabview, LV_SYMBOL_GPS);
 #if defined(HAS_EXPANSION_KIT)
-  lv_obj_t* tab_sensors  = lv_tabview_add_tab(g_lv.tabview, LV_SYMBOL_CHARGE);   // environment / sensors (Expansion Kit)
+  // Sensors tab is conditional: only add it (and shift Settings to index 5) when
+  // an env sensor is present and the user pref is on. Otherwise Settings lands
+  // at index 4 — exactly the non-Expansion layout. The runtime tab-index globals
+  // are set here so the rest of the UI agrees on the indices.
+  lv_obj_t* tab_sensors = nullptr;
+  if (sensorsUiWanted()) {
+    tab_sensors = lv_tabview_add_tab(g_lv.tabview, LV_SYMBOL_CHARGE);   // environment / sensors (Expansion Kit)
+    SENSORS_TAB_INDEX  = 4;
+    SETTINGS_TAB_INDEX = 5;
+    TAB_LAST           = 5;
+  } else {
+    SENSORS_TAB_INDEX  = -1;
+    SETTINGS_TAB_INDEX = 4;
+    TAB_LAST           = 4;
+  }
 #endif
   lv_obj_t* tab_settings = lv_tabview_add_tab(g_lv.tabview, LV_SYMBOL_SETTINGS);
   // Slightly larger font for icons so they're easy to tap.
@@ -27907,7 +28004,7 @@ static void buildUiTree() {
   makeContactsTab(tab_contacts);
   makeMapTab(tab_map);
 #if defined(HAS_EXPANSION_KIT)
-  makeSensorsTab(tab_sensors);
+  if (tab_sensors) makeSensorsTab(tab_sensors);
 #endif
 
   // Red "!" update badge over the Settings gear (rightmost bottom tab). A child
