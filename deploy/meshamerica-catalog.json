@@ -16,19 +16,19 @@
           "role": "gui",
           "title": "Touch UI",
           "version": {
-            "beta_18": {
-              "notes": "A topographic map style: turn on Map -> Options -> \"Topographic map\" for terrain-relief tiles (OpenStreetMap stays the default). Thanks to Samuel Coustet for the proxy work (#52).\nNew emoji in the picker: soccer ball, american football, moai, and the transgender flag.\nContacts can now sort ascending or descending, and there's a new \"Nearest first\" sort that orders contacts by distance from you (contacts without a shared location are left out).\nThe Discovered list gets the same sorting — by most-recently-heard, name, or distance — from a new sort button in its header.\nThe Chats header is tidied up: the add / mark-all-read / share-contact buttons are grouped together on the left, and sharing your contact now uses a proper QR icon.\nThe USB/PC companion connection no longer drops or throws \"bad state\" errors mid-session. The same fix also clears up repeater admin mode disconnecting and not being able to log in to member rooms.\nMap tiles along the edges and corners of the view now fill in automatically as you pan, instead of needing a manual \"reload tiles\".\nReclaimed about 41 KB of memory by moving a large internal buffer to PSRAM — this fixes the Heltec V4 running out of RAM and rebooting when it loaded map tiles, and leaves more headroom on every board.\nThe map's \"Show link lines\" toggle is now remembered across reboots. Thanks to Yazutsu (#61).\nSettings category names (Bluetooth, Radio & Mesh, Quick replies, ...) now fit on one line instead of wrapping or splitting mid-word.\nTurning keyboard navigation on or off no longer snaps the settings list back to the top.\nHeltec V4: the node name in the status bar no longer covers the clock.\nT-Deck: the keyboard backlight no longer gets stuck on after flashing when it's set to Off.\nCrash reporting is more reliable (it only prompts after an actual crash, not on every restart), and there are fewer stray reboots while saving settings.\nTanmatsu: changing the LoRa radio settings (frequency and so on) now takes effect immediately, without needing a reboot, and the app's settings now drive the radio.\nEverything from beta_16 (and the Tanmatsu's beta_17) is included.",
+            "beta_19": {
+              "notes": "Radio & Mesh settings now show an airtime / duty-cycle readout: roughly how much of the airtime budget your current spreading factor, bandwidth and coding rate use, plus the time-on-air per packet — handy for staying inside regional limits like EU 868.\nA new \"Answer telemetry requests\" toggle in Radio & Mesh settings controls whether other nodes can pull your battery and environment telemetry.\nThe Radio & Mesh settings page is now split into clear RADIO / MESH / SIGNAL sections so the options are easier to find.\nFixed a reboot that could happen when you closed a scrollable popup — the emoji picker, quick replies, the Wi-Fi scan list, the app drawer and similar — while it was still coasting from a flick. Thanks to everyone who sent in crash reports.\nThe accent popup no longer lingers on screen after you send a message on the T-Deck keyboard.\nHeltec V4: the Expansion Kit environment line and mini chart on the Home screen no longer overlap the status text or run off the bottom of the display.\nEverything from beta_18 is included.",
               "files": [
                 {
                   "type": "flash-wipe",
                   "name": "wadamesh-heltec-v4-tft-merged.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_18/wadamesh-heltec-v4-tft-merged.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_19/wadamesh-heltec-v4-tft-merged.bin",
                   "title": "Full install (bootloader + firmware)"
                 },
                 {
                   "type": "flash-update",
                   "name": "wadamesh-heltec-v4-tft.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_18/wadamesh-heltec-v4-tft.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_19/wadamesh-heltec-v4-tft.bin",
                   "title": "Update (app only)"
                 }
               ]
@@ -48,19 +48,19 @@
           "role": "gui",
           "title": "Touch UI",
           "version": {
-            "beta_18": {
-              "notes": "A topographic map style: turn on Map -> Options -> \"Topographic map\" for terrain-relief tiles (OpenStreetMap stays the default). Thanks to Samuel Coustet for the proxy work (#52).\nNew emoji in the picker: soccer ball, american football, moai, and the transgender flag.\nContacts can now sort ascending or descending, and there's a new \"Nearest first\" sort that orders contacts by distance from you (contacts without a shared location are left out).\nThe Discovered list gets the same sorting — by most-recently-heard, name, or distance — from a new sort button in its header.\nThe Chats header is tidied up: the add / mark-all-read / share-contact buttons are grouped together on the left, and sharing your contact now uses a proper QR icon.\nThe USB/PC companion connection no longer drops or throws \"bad state\" errors mid-session. The same fix also clears up repeater admin mode disconnecting and not being able to log in to member rooms.\nMap tiles along the edges and corners of the view now fill in automatically as you pan, instead of needing a manual \"reload tiles\".\nReclaimed about 41 KB of memory by moving a large internal buffer to PSRAM — this fixes the Heltec V4 running out of RAM and rebooting when it loaded map tiles, and leaves more headroom on every board.\nThe map's \"Show link lines\" toggle is now remembered across reboots. Thanks to Yazutsu (#61).\nSettings category names (Bluetooth, Radio & Mesh, Quick replies, ...) now fit on one line instead of wrapping or splitting mid-word.\nTurning keyboard navigation on or off no longer snaps the settings list back to the top.\nHeltec V4: the node name in the status bar no longer covers the clock.\nT-Deck: the keyboard backlight no longer gets stuck on after flashing when it's set to Off.\nCrash reporting is more reliable (it only prompts after an actual crash, not on every restart), and there are fewer stray reboots while saving settings.\nTanmatsu: changing the LoRa radio settings (frequency and so on) now takes effect immediately, without needing a reboot, and the app's settings now drive the radio.\nEverything from beta_16 (and the Tanmatsu's beta_17) is included.",
+            "beta_19": {
+              "notes": "Radio & Mesh settings now show an airtime / duty-cycle readout: roughly how much of the airtime budget your current spreading factor, bandwidth and coding rate use, plus the time-on-air per packet — handy for staying inside regional limits like EU 868.\nA new \"Answer telemetry requests\" toggle in Radio & Mesh settings controls whether other nodes can pull your battery and environment telemetry.\nThe Radio & Mesh settings page is now split into clear RADIO / MESH / SIGNAL sections so the options are easier to find.\nFixed a reboot that could happen when you closed a scrollable popup — the emoji picker, quick replies, the Wi-Fi scan list, the app drawer and similar — while it was still coasting from a flick. Thanks to everyone who sent in crash reports.\nThe accent popup no longer lingers on screen after you send a message on the T-Deck keyboard.\nHeltec V4: the Expansion Kit environment line and mini chart on the Home screen no longer overlap the status text or run off the bottom of the display.\nEverything from beta_18 is included.",
               "files": [
                 {
                   "type": "flash-wipe",
                   "name": "wadamesh-tdeck-merged.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_18/wadamesh-tdeck-merged.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_19/wadamesh-tdeck-merged.bin",
                   "title": "Full install (bootloader + firmware)"
                 },
                 {
                   "type": "flash-update",
                   "name": "wadamesh-tdeck.bin",
-                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_18/wadamesh-tdeck.bin",
+                  "url": "https://firmware.wadamesh.com/releases/TOUCH/beta_19/wadamesh-tdeck.bin",
                   "title": "Update (app only)"
                 }
               ]
